@@ -1003,6 +1003,12 @@ def backfill_delisted_bars(
     columns exist for. ``adj_factors`` picks them up on the next derive because
     it iterates the symbols present in ``daily_bars``.
 
+    Only symbols with actually recovered bars are marked ingested. A raised
+    fetch and an empty response are both unresolved evidence for a recovery
+    target — the symbol stays out of ``delisted_ingested`` and is retried on
+    the next run, surfaced as ``failed_symbols`` / ``empty_symbols`` with a
+    ``delisted_backfill_incomplete`` audit finding.
+
     Staged in chunks so an interrupted multi-hour sweep keeps what it fetched,
     with the per-symbol date spans accumulated across chunks — they are what the
     ``instruments`` rows are built from at the end.
@@ -1020,6 +1026,7 @@ def backfill_delisted_bars(
     logger.info("delisted bars: %d symbol(s) to fetch from %s", len(todo), start.isoformat())
     rows_written = 0
     failed: list[str] = []
+    empty: list[str] = []
     spans: dict[str, tuple[date, date]] = {}
     events: list[dict] = []
     pending_frames: list[pl.DataFrame] = []
@@ -1052,20 +1059,26 @@ def backfill_delisted_bars(
                 logger.warning("delisted bars: fetch failed for %s: %s", symbol, exc)
                 failed.append(symbol)
                 continue
-            if not bars.is_empty():
-                pending_frames.append(bars)
-                spans[symbol] = (bars["trade_date"].min(), bars["trade_date"].max())
-                # Classified from the *full* fetched series, before the window
-                # filter — the halt and the resumption drop are what identify a
-                # consolidation period, and they sit at the very end.
-                events.append(
-                    {
-                        "symbol": symbol,
-                        "first_trade_date": bars["trade_date"].min(),
-                        "last_trade_date": bars["trade_date"].max(),
-                        **classify_ending(bars),
-                    }
-                )
+            if bars.is_empty():
+                # Empty history for a target that provably overlapped the window
+                # is unresolved evidence, not successful ingestion: keep it
+                # retryable and never mark it done.
+                logger.warning("delisted bars: empty response for %s", symbol)
+                empty.append(symbol)
+                continue
+            pending_frames.append(bars)
+            spans[symbol] = (bars["trade_date"].min(), bars["trade_date"].max())
+            # Classified from the *full* fetched series, before the window
+            # filter — the halt and the resumption drop are what identify a
+            # consolidation period, and they sit at the very end.
+            events.append(
+                {
+                    "symbol": symbol,
+                    "first_trade_date": bars["trade_date"].min(),
+                    "last_trade_date": bars["trade_date"].max(),
+                    **classify_ending(bars),
+                }
+            )
             pending_symbols.append(symbol)
             if index % _INGEST_CHUNK == 0:
                 flush(index // _INGEST_CHUNK)
@@ -1086,15 +1099,17 @@ def backfill_delisted_bars(
         "recovered": len(spans),
         "ending_patterns": dict(Counter(e["ending_pattern"] for e in events)),
     }
-    if failed:
+    if failed or empty:
         result["failed_symbols"] = len(failed)
+        result["empty_symbols"] = len(empty)
         result.setdefault("context_updates", {})["audit_findings"] = [
             {
                 "dataset": "daily_bars",
                 "severity": "warning",
                 "check": "delisted_backfill_incomplete",
                 "message": (
-                    f"{len(failed)}/{len(todo)} delisted symbols failed to fetch; re-run to resume"
+                    f"{len(failed)} failed / {len(empty)} empty of {len(todo)} "
+                    "delisted recovery targets; re-run to resume"
                 ),
             }
         ]

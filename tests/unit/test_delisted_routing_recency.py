@@ -18,6 +18,7 @@ import pytest
 
 from ashare_lake.config import Config, load_config
 from ashare_lake.config.bootstrap import path_for_toml
+from ashare_lake.domain.schemas import DAILY_BARS_SCHEMA
 from ashare_lake.orchestrator.manifest import Manifest
 from ashare_lake.steps import bars, delisted
 from ashare_lake.steps.common import classify_daily_routing
@@ -605,3 +606,50 @@ def test_backfill_recovers_formal_only_target(cfg):
     )
     assert again.get("symbols", 0) == 0
     assert "no delisted recovery targets" in again.get("note", "")
+
+
+def _empty_bars_frame() -> pl.DataFrame:
+    cols = [c for c in DAILY_BARS_SCHEMA if c not in ("source", "data_version", "fetched_at")]
+    return pl.DataFrame(schema={c: DAILY_BARS_SCHEMA[c] for c in cols})
+
+
+def test_empty_backfill_stays_fail_closed_and_recoverable(tmp_path, monkeypatch):
+    """Empty response: not ingested, gate fail-closed, next run still targets."""
+    cfg = Config(data_root=tmp_path / "data", sources={"sina": True})
+    init_data_layout(cfg)
+    _write_curated_instruments(cfg, [("600001.SH", date(2026, 7, 14))])
+    _write_catalog(cfg, {"600001.SH": "2026-07-17"})
+    _write_anchor_bar(cfg)
+    monkeypatch.setattr("ashare_lake.steps.delisted.pending_codes", lambda cfg: [])
+
+    first = delisted.backfill_delisted_bars(
+        cfg,
+        "run-1",
+        WINDOW_START,
+        fetch=lambda s, c: _empty_bars_frame(),
+    )
+    assert first["empty_symbols"] == 1
+    assert first["recovered"] == 0
+    assert "600001.SH" not in delisted._ingested_symbols(cfg)
+    assert "600001.SH" in delisted_backfill_targets(cfg, WINDOW_START, WINDOW_END)
+
+    report = delisted_coverage_report(cfg, WINDOW_START, WINDOW_END)
+    assert report["verified"] is False
+    assert report["counts"]["missing_bars"] == 1
+
+    # A later run recovers valid bars: staged, ingested, coverage can verify.
+    second = delisted.backfill_delisted_bars(
+        cfg,
+        "run-2",
+        WINDOW_START,
+        fetch=_fake_sina_bars,
+    )
+    assert second["recovered"] == 1
+    assert "600001.SH" in delisted._ingested_symbols(cfg)
+    assert _staged_daily_symbols(cfg, "run-2") == {"600001.SH"}
+    # Compact would land the recovered bars in curated; simulate it.
+    _write_bar(cfg, "600001.SH", date(2026, 7, 14))
+    covered = delisted_coverage_report(cfg, WINDOW_START, WINDOW_END)
+    assert covered["counts"]["missing_bars"] == 0
+    assert covered["counts"]["proven_overlap"] == 1
+    assert covered["verified"] is True
