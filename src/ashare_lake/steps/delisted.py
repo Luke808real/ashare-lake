@@ -38,7 +38,7 @@ import polars as pl
 
 from ashare_lake.config import Config
 from ashare_lake.domain.symbols import issued_code_space
-from ashare_lake.steps.common import is_trading_day, load_symbols
+from ashare_lake.steps.common import is_trading_day
 
 logger = logging.getLogger(__name__)
 
@@ -177,9 +177,9 @@ def _live_symbols(config: Config) -> set[str]:
         return set(load_symbols(config))
     ref = _reference_date(config)
     return set(
-        meta.filter(
-            pl.col("delist_date").is_null() | (pl.col("delist_date") > ref)
-        )["symbol"].to_list()
+        meta.filter(pl.col("delist_date").is_null() | (pl.col("delist_date") > ref))[
+            "symbol"
+        ].to_list()
     )
 
 

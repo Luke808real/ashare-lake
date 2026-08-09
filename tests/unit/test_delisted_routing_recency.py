@@ -294,9 +294,7 @@ def test_retry_mixed_batch_fetches_generic_only_and_records_delegated(cfg):
 
 def test_pending_codes_does_not_mask_delisted_as_live(cfg):
     init_data_layout(cfg)
-    _write_instruments(
-        cfg, [r for r in _instrument_rows() if r["symbol"] in (LIVE, A_SYMBOL)]
-    )
+    _write_instruments(cfg, [r for r in _instrument_rows() if r["symbol"] in (LIVE, A_SYMBOL)])
 
     pending = pending_codes(cfg)
 
@@ -450,9 +448,7 @@ def test_frozen_replay_real_runtime_semantics(tmp_path, monkeypatch):
     # Coverage gate view with the real 30-day rule: 4 recency-edge names are
     # quarantined at the catalogue level, keeping the gate fail-closed.
     cfg = Config(data_root=tmp_path / "data", sources={"sina": True})
-    _write_curated_instruments(
-        cfg, [(sym, spans[sym][1]) for sym in spans]
-    )
+    _write_curated_instruments(cfg, [(sym, spans[sym][1]) for sym in spans])
     _write_catalog(cfg, {sym: spans[sym][1].isoformat() for sym in spans})
     _write_anchor_bar(cfg)
     monkeypatch.setattr("ashare_lake.steps.delisted.pending_codes", lambda cfg: [])
@@ -468,4 +464,6 @@ def test_frozen_replay_real_runtime_semantics(tmp_path, monkeypatch):
     assert report["verified"] is False
     quarantined_symbols = {s["symbol"] for s in report["samples"]["recent_quarantined"]}
     assert quarantined_symbols == set(recent)
-    assert all(s["basis"] == "known_delisted_quarantined" for s in report["samples"]["recent_quarantined"])
+    assert all(
+        s["basis"] == "known_delisted_quarantined" for s in report["samples"]["recent_quarantined"]
+    )
