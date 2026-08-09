@@ -23,9 +23,11 @@ from ashare_lake.steps import bars, delisted
 from ashare_lake.steps.common import classify_daily_routing
 from ashare_lake.steps.delisted import (
     catalog_path,
+    delisted_backfill_targets,
     delisted_coverage_report,
     delisted_symbols_in_window,
     known_delisted_instruments,
+    load_delisted_catalog,
     load_live_missing,
     pending_codes,
 )
@@ -147,6 +149,7 @@ def _write_curated_instruments(cfg, rows: list[tuple[str, date | None]]) -> None
     pl.DataFrame(
         {
             "symbol": [row[0] for row in rows],
+            "list_date": pl.Series([None] * len(rows), dtype=pl.Date),
             "delist_date": pl.Series([row[1] for row in rows], dtype=pl.Date),
         }
     ).write_parquet(root / "part-merged.parquet")
@@ -321,7 +324,7 @@ def test_probe_only_recent_terminal_is_quarantined(tmp_path, monkeypatch):
     assert report["verified"] is False
 
 
-def test_known_delisted_quarantined_still_blocks_coverage(tmp_path, monkeypatch):
+def test_known_delisted_quarantined_identity_resolved_but_bars_required(tmp_path, monkeypatch):
     cfg = Config(data_root=tmp_path / "data", sources={"sina": True})
     _write_curated_instruments(cfg, [("600001.SH", date(2026, 7, 14))])
     _write_catalog(cfg, {"600001.SH": "2026-07-17"})  # probe last within 30 days
@@ -333,10 +336,13 @@ def test_known_delisted_quarantined_still_blocks_coverage(tmp_path, monkeypatch)
 
     assert report["counts"]["known_delisted_instruments"] == 1
     assert report["counts"]["known_delisted_in_window"] == 1
-    assert report["counts"]["recent_quarantined"] == 1
-    entry = report["samples"]["recent_quarantined"][0]
+    # Formal authority resolves identity: not a probe-only quarantine blocker,
+    # but the missing bars still fail the gate.
+    assert report["counts"]["recent_quarantined"] == 0
+    assert report["counts"]["catalog_recent_quarantined"] == 1
+    assert report["counts"]["missing_bars"] == 1
+    entry = report["samples"]["catalog_recent_quarantined"][0]
     assert entry["symbol"] == "600001.SH"
-    assert entry["basis"] == "known_delisted_quarantined"
     assert report["verified"] is False
 
 
@@ -445,8 +451,9 @@ def test_frozen_replay_real_runtime_semantics(tmp_path, monkeypatch):
     )
     assert recent == ["000004.SZ", "002808.SZ", "002898.SZ", "300029.SZ"]
 
-    # Coverage gate view with the real 30-day rule: 4 recency-edge names are
-    # quarantined at the catalogue level, keeping the gate fail-closed.
+    # Coverage gate view with the real 30-day rule: the 4 recency-edge names
+    # are quarantined at the catalogue level (diagnostic), but formal authority
+    # resolves identity — their missing bars fail the gate.
     cfg = Config(data_root=tmp_path / "data", sources={"sina": True})
     _write_curated_instruments(cfg, [(sym, spans[sym][1]) for sym in spans])
     _write_catalog(cfg, {sym: spans[sym][1].isoformat() for sym in spans})
@@ -458,12 +465,143 @@ def test_frozen_replay_real_runtime_semantics(tmp_path, monkeypatch):
     assert counts["known_delisted_instruments"] == 336
     assert counts["known_delisted_in_window"] == 107
     assert counts["expected_no_data"] == 229
-    assert counts["recent_quarantined"] == 4
+    assert counts["recent_quarantined"] == 0  # all 336 carry formal authority
+    assert counts["catalog_recent_quarantined"] == 4  # diagnostic only
     assert counts["known_delisted_unreconciled"] == 0
-    assert counts["missing_bars"] == 103
+    assert counts["missing_bars"] == 107
     assert report["verified"] is False
-    quarantined_symbols = {s["symbol"] for s in report["samples"]["recent_quarantined"]}
+    quarantined_symbols = {s["symbol"] for s in report["samples"]["catalog_recent_quarantined"]}
     assert quarantined_symbols == set(recent)
-    assert all(
-        s["basis"] == "known_delisted_quarantined" for s in report["samples"]["recent_quarantined"]
+
+    # Recovery ownership: formal authority makes every in-window delisting a
+    # backfill target immediately (107), even under catalogue quarantine; no
+    # probe-only blocker exists among these 336.
+    targets = delisted_backfill_targets(cfg, WINDOW_START, WINDOW_END)
+    assert len(targets) == 107
+    assert set(targets) == set(routing.excluded_delegated_delisted)
+
+    # Coverage closure: once every formal target has recovered bars (including
+    # the 4 catalogue-quarantined names), the gate verifies.
+    for symbol, (_list_date, formal) in spans.items():
+        if formal >= WINDOW_START:
+            _write_bar(cfg, symbol, formal)
+    covered = delisted_coverage_report(cfg, WINDOW_START, WINDOW_END)
+    covered_counts = covered["counts"]
+    assert covered_counts["missing_bars"] == 0
+    assert covered_counts["recent_quarantined"] == 0
+    assert covered_counts["proven_overlap"] == 107
+    assert covered["verified"] is True
+
+
+# --- backfill target closure ------------------------------------------------
+
+
+def test_formal_recent_delisting_is_backfill_target(tmp_path):
+    """The critical regression: formal authority beats catalogue quarantine."""
+    cfg = Config(data_root=tmp_path / "data", sources={"sina": True})
+    _write_curated_instruments(cfg, [("600001.SH", date(2026, 7, 14))])
+    _write_catalog(cfg, {"600001.SH": "2026-07-17"})  # probe last within 30 days
+    _write_anchor_bar(cfg)
+
+    assert "600001.SH" in load_live_missing(cfg), "catalogue classification = quarantine"
+    assert "600001.SH" not in load_delisted_catalog(cfg), "not definite at catalogue level"
+    assert known_delisted_instruments(cfg, WINDOW_END) == {"600001.SH": date(2026, 7, 14)}
+    assert delisted_backfill_targets(cfg, WINDOW_START, WINDOW_END) == ["600001.SH"]
+
+
+def test_probe_only_recent_is_not_backfill_target(tmp_path):
+    cfg = Config(data_root=tmp_path / "data", sources={"sina": True})
+    _write_catalog(cfg, {"600099.SH": "2026-07-20"})  # probe-only, within 30 days
+    _write_anchor_bar(cfg)
+
+    assert delisted_backfill_targets(cfg, WINDOW_START, WINDOW_END) == []
+
+
+def test_formal_pre_window_is_not_backfill_target(tmp_path):
+    cfg = Config(data_root=tmp_path / "data", sources={"sina": True})
+    _write_curated_instruments(cfg, [("600002.SH", date(2006, 4, 6))])
+    _write_anchor_bar(cfg)
+
+    assert delisted_backfill_targets(cfg, WINDOW_START, WINDOW_END) == []
+
+
+def test_formal_future_relative_as_of_is_not_backfill_target(tmp_path):
+    cfg = Config(data_root=tmp_path / "data", sources={"sina": True})
+    _write_curated_instruments(cfg, [("600004.SH", date(2026, 9, 1))])
+    _write_anchor_bar(cfg)
+
+    assert delisted_backfill_targets(cfg, WINDOW_START, WINDOW_END) == []
+
+
+def test_catalog_definite_is_backfill_target(tmp_path):
+    cfg = Config(data_root=tmp_path / "data", sources={"sina": True})
+    _write_catalog(cfg, {"600005.SH": "2024-05-10"})
+    _write_anchor_bar(cfg)
+
+    assert delisted_backfill_targets(cfg, WINDOW_START, WINDOW_END) == ["600005.SH"]
+
+
+def test_duplicate_authority_yields_single_backfill_target(tmp_path):
+    cfg = Config(data_root=tmp_path / "data", sources={"sina": True})
+    _write_curated_instruments(cfg, [("600006.SH", date(2024, 5, 10))])
+    _write_catalog(cfg, {"600006.SH": "2024-05-10"})
+    _write_anchor_bar(cfg)
+
+    assert delisted_backfill_targets(cfg, WINDOW_START, WINDOW_END) == ["600006.SH"]
+
+
+def test_already_ingested_is_not_backfill_target(tmp_path):
+    cfg = Config(data_root=tmp_path / "data", sources={"sina": True})
+    _write_curated_instruments(cfg, [("600001.SH", date(2026, 7, 14))])
+    _write_catalog(cfg, {"600001.SH": "2026-07-17"})
+    _write_anchor_bar(cfg)
+    state = cfg.meta_root / "state" / "delisted_ingested.json"
+    state.parent.mkdir(parents=True, exist_ok=True)
+    state.write_text(json.dumps({"completed": ["600001.SH"]}))
+
+    assert delisted_backfill_targets(cfg, WINDOW_START, WINDOW_END) == []
+
+
+def _fake_sina_bars(symbol: str, client=None) -> pl.DataFrame:
+    return pl.DataFrame(
+        {
+            "symbol": [symbol, symbol],
+            "trade_date": [date(2026, 7, 10), date(2026, 7, 14)],
+            "open": [10.0, 10.5],
+            "high": [10.8, 11.0],
+            "low": [9.8, 10.2],
+            "close": [10.4, 10.9],
+            "volume": [1_000_000, 900_000],
+            "amount": [10_400_000.0, 9_810_000.0],
+        }
     )
+
+
+def test_backfill_recovers_formal_only_target(cfg):
+    """backfill_delisted_bars reaches a catalogue-quarantined formal delisting."""
+    init_data_layout(cfg)
+    manifest = Manifest(cfg.manifest_path)
+    run_id = manifest.start_run("test")
+    _write_curated_instruments(cfg, [("600001.SH", date(2026, 7, 14))])
+    _write_catalog(cfg, {"600001.SH": "2026-07-17"})  # quarantined at catalogue level
+    _write_anchor_bar(cfg)
+
+    result = delisted.backfill_delisted_bars(
+        cfg,
+        run_id,
+        WINDOW_START,
+        fetch=_fake_sina_bars,
+    )
+
+    assert result["symbols"] == 1
+    assert result["recovered"] == 1
+    assert _staged_daily_symbols(cfg, run_id) == {"600001.SH"}
+    # The recovered name is marked ingested: a re-run is a no-op.
+    again = delisted.backfill_delisted_bars(
+        cfg,
+        run_id,
+        WINDOW_START,
+        fetch=_fake_sina_bars,
+    )
+    assert again.get("symbols", 0) == 0
+    assert "no delisted recovery targets" in again.get("note", "")

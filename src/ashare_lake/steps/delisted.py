@@ -329,6 +329,34 @@ def delisted_symbols_in_window(config: Config, start: date) -> list[str]:
     return sorted(s for s, last in catalog.items() if last >= start and s not in already)
 
 
+def delisted_backfill_targets(config: Config, start: date, as_of: date) -> list[str]:
+    """Unified dedicated-recovery targets: formal authority + definite catalogue.
+
+    The generic daily path delegates every symbol with ``delist_date <= as_of``
+    out of TDX/EastMoney; this selector is the dedicated pipeline's side of the
+    same ownership contract. A symbol is a recovery target when EITHER:
+
+    * FORMAL — ``instruments.delist_date`` is on/before *as_of* (known
+      delisting, decisive) and on/after *start*; or
+    * UNAMBIGUOUS_CATALOG — the probe catalogue classifies it as genuinely
+      delisted with ``last_traded >= start``.
+
+    Probe-only recent terminals (``LIVE_RECENCY_DAYS`` quarantine) stay
+    excluded; formal authority resolves identity immediately. ``delist_date <
+    start`` is expected-no-data; ``delist_date > as_of`` would be
+    future-information leakage and is never a target. Already-ingested symbols
+    are dropped; a symbol present in both authorities appears exactly once.
+    """
+    formal = {
+        symbol
+        for symbol, formal in known_delisted_instruments(config, as_of).items()
+        if formal >= start
+    }
+    catalog = {symbol for symbol, last in load_delisted_catalog(config).items() if last >= start}
+    already = _ingested_symbols(config)
+    return sorted(s for s in formal | catalog if s not in already)
+
+
 def _instruments_rows(config: Config, spans: dict[str, tuple[date | None, date]]) -> pl.DataFrame:
     """instruments rows for the recovered names, unioned with the live snapshot.
 
@@ -445,9 +473,11 @@ def delisted_coverage_report(
     Ownership closure: every symbol the *formal* instrument metadata says
     delisted on/before ``end`` must end in an explicit state. Formal
     ``instruments.delist_date`` is decisive even while its probe evidence is
-    still inside ``LIVE_RECENCY_DAYS`` (known delisting), and probe-only recent
-    terminals overlapping the window keep the report fail-closed
-    (``recent_quarantined``) instead of letting coverage silently pass.
+    still inside ``LIVE_RECENCY_DAYS``: the symbol is evaluated against bars
+    and instruments like any other required target (``catalog_recent_quarantined``
+    stays a diagnostic only). Probe-only recent terminals with no formal
+    authority keep the report fail-closed (``recent_quarantined``) instead of
+    letting coverage silently pass.
     """
     end = end or _reference_date(config)
     if start > end:
@@ -457,7 +487,12 @@ def delisted_coverage_report(
 
     catalog = load_delisted_catalog(config)
     candidates = {symbol: last for symbol, last in catalog.items() if last >= start}
-    symbols = sorted(candidates)
+    # Formal authority is known before the bars scan: known-delisted symbols
+    # quarantined at catalogue level are required targets too, so their bars
+    # must be scanned alongside the unambiguous catalogue candidates.
+    known = known_delisted_instruments(config, end)
+    known_in_window = {symbol: formal for symbol, formal in known.items() if formal >= start}
+    symbols = sorted(set(candidates) | set(known_in_window))
 
     spans: dict[str, tuple[date, date]] = {}
     bars_root = config.curated_root / "daily_bars"
@@ -503,7 +538,7 @@ def delisted_coverage_report(
     invalid_delist_dates: list[dict] = []
     proven_overlap = 0
 
-    for symbol in symbols:
+    for symbol in sorted(candidates):
         catalog_last = candidates[symbol]
         span = spans.get(symbol)
         overlap_is_definite = catalog_last <= end
@@ -546,8 +581,6 @@ def delisted_coverage_report(
 
     pending = pending_codes(config)
     # Recency/identity closure (Source A vs Source B of the recency contract).
-    known = known_delisted_instruments(config, end)
-    known_in_window = {symbol: formal for symbol, formal in known.items() if formal >= start}
     raw_catalog = _read_catalog(config)["delisted"]
     live_missing = classify_catalog(config)[1]
 
@@ -556,41 +589,70 @@ def delisted_coverage_report(
         for symbol, formal in sorted(known.items())
         if formal < start
     ]
-    recent_quarantined: list[dict] = []
-    for symbol, last in sorted(live_missing.items()):
-        if last >= start and symbol not in known_in_window:
-            recent_quarantined.append(
-                {
-                    "symbol": symbol,
-                    "probe_last_traded": last.isoformat(),
-                    "basis": "probe_only",
-                }
-            )
+    # Probe-only recent terminals (no formal authority): quarantine, fail-closed.
+    recent_quarantined: list[dict] = [
+        {
+            "symbol": symbol,
+            "probe_last_traded": last.isoformat(),
+            "basis": "probe_only",
+        }
+        for symbol, last in sorted(live_missing.items())
+        if last >= start and symbol not in known_in_window
+    ]
+    # Known-delisted symbols still quarantined at catalogue level: diagnostic
+    # only — formal authority resolves identity, so they are evaluated against
+    # bars/instruments by the formal-target loop below.
+    catalog_recent_quarantined: list[dict] = [
+        {
+            "symbol": symbol,
+            "formal_delist_date": formal.isoformat(),
+            "probe_last_traded": live_missing[symbol].isoformat(),
+        }
+        for symbol, formal in sorted(known_in_window.items())
+        if symbol in live_missing
+    ]
     unreconciled: list[dict] = []
     for symbol, formal in sorted(known_in_window.items()):
-        if symbol in candidates:
+        if symbol in candidates or symbol in live_missing:
             continue  # the main loop above owns the full evidence check
-        if symbol in live_missing:
-            recent_quarantined.append(
+        raw_last = raw_catalog.get(symbol)
+        unreconciled.append(
+            {
+                "symbol": symbol,
+                "formal_delist_date": formal.isoformat(),
+                **({"catalog_last_traded": raw_last} if raw_last is not None else {}),
+                "reason": (
+                    "catalog_terminal_before_window_conflicts_with_formal"
+                    if raw_last is not None
+                    else "not_discovered"
+                ),
+            }
+        )
+    # Formal-only targets (quarantined at catalogue level): bars are required,
+    # recovered bars prove the overlap, and a bar after the formal delisting
+    # date contradicts identity.
+    for symbol, formal in sorted(known_in_window.items()):
+        if symbol in candidates:
+            continue
+        span = spans.get(symbol)
+        if span is None:
+            missing_bars.append(
                 {
                     "symbol": symbol,
                     "formal_delist_date": formal.isoformat(),
-                    "probe_last_traded": live_missing[symbol].isoformat(),
-                    "basis": "known_delisted_quarantined",
+                    "catalog_last_traded": None,
                 }
             )
-        else:
-            raw_last = raw_catalog.get(symbol)
-            unreconciled.append(
+            continue
+        proven_overlap += 1
+        actual = instrument_dates.get(symbol)
+        if actual is None or actual < span[1]:
+            invalid_delist_dates.append(
                 {
                     "symbol": symbol,
+                    "catalog_last_traded": None,
                     "formal_delist_date": formal.isoformat(),
-                    **({"catalog_last_traded": raw_last} if raw_last is not None else {}),
-                    "reason": (
-                        "catalog_terminal_before_window_conflicts_with_formal"
-                        if raw_last is not None
-                        else "not_discovered"
-                    ),
+                    "instrument_delist_date": actual.isoformat() if actual else None,
                 }
             )
 
@@ -625,6 +687,7 @@ def delisted_coverage_report(
             "known_delisted_in_window": len(known_in_window),
             "expected_no_data": len(expected_no_data),
             "recent_quarantined": len(recent_quarantined),
+            "catalog_recent_quarantined": len(catalog_recent_quarantined),
             "known_delisted_unreconciled": len(unreconciled),
             "missing_bars": len(missing_bars),
             "unknown_overlap": len(unknown_overlap),
@@ -636,6 +699,7 @@ def delisted_coverage_report(
             "pending_probe": limited(pending),
             "expected_no_data": limited(expected_no_data),
             "recent_quarantined": limited(recent_quarantined),
+            "catalog_recent_quarantined": limited(catalog_recent_quarantined),
             "known_delisted_unreconciled": limited(unreconciled),
             "missing_bars": limited(missing_bars),
             "unknown_overlap": limited(unknown_overlap),
@@ -927,7 +991,12 @@ def backfill_delisted_bars(
     *,
     fetch=None,
 ) -> dict:
-    """Fetch full price history for catalogued delistings and stage it.
+    """Fetch full price history for known-delisted recovery targets and stage it.
+
+    The target set is the unified recovery selector: formal instrument
+    authority (``delist_date <= as_of``, decisive even under catalogue
+    quarantine) unioned with unambiguous probe-catalogue terminals. Probe-only
+    recent terminals stay quarantined by ``LIVE_RECENCY_DAYS``.
 
     Bars land in ``daily_bars`` alongside the live names with ``source='sina'``:
     the same kind of fact from a different vendor, which is what the provenance
@@ -944,9 +1013,9 @@ def backfill_delisted_bars(
     fetch = fetch or (
         lambda symbol, client: fetch_daily_bars_sina(symbol, start=start, client=client)
     )
-    todo = delisted_symbols_in_window(config, start)
+    todo = delisted_backfill_targets(config, start, _reference_date(config))
     if not todo:
-        return {"rows_read": 0, "rows_written": 0, "note": "no catalogued delistings to ingest"}
+        return {"rows_read": 0, "rows_written": 0, "note": "no delisted recovery targets to ingest"}
 
     logger.info("delisted bars: %d symbol(s) to fetch from %s", len(todo), start.isoformat())
     rows_written = 0

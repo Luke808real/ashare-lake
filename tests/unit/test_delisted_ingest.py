@@ -153,7 +153,7 @@ def test_rerun_is_a_noop_once_everything_is_ingested(tmp_path):
 
     result = backfill_delisted_bars(cfg, "run-2", _START, fetch=must_not_be_called)
     assert result["rows_written"] == 0
-    assert "no catalogued delistings" in result["note"]
+    assert "no delisted recovery targets" in result["note"]
 
 
 def test_a_symbol_with_no_bars_is_marked_done_but_adds_no_instrument(tmp_path):
