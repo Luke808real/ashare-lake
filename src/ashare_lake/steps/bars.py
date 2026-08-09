@@ -13,7 +13,13 @@ from ashare_lake.config import Config
 from ashare_lake.domain.symbols import split_by_quote_source
 from ashare_lake.orchestrator.registry import register_step
 from ashare_lake.orchestrator.worker_pool import fetch_daily_bars_parallel
-from ashare_lake.steps.common import BACKFILL_START, incremental_window, load_symbols
+from ashare_lake.steps.common import (
+    BACKFILL_START,
+    DailyRouting,
+    classify_daily_routing,
+    incremental_window,
+    load_symbols,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +36,115 @@ def _backfill_window(config: Config, trade_date: date) -> tuple[date, date]:
     return start, end
 
 
+def _instrument_spans(config: Config) -> dict[str, tuple[date | None, date | None]]:
+    """``symbol -> (list_date, delist_date)`` from the routing metadata source."""
+    from ashare_lake.steps.common import instrument_metadata
+
+    meta = instrument_metadata(config)
+    spans: dict[str, tuple[date | None, date | None]] = {}
+    for row in meta.iter_rows(named=True):
+        spans[row["symbol"]] = (row["list_date"], row["delist_date"])
+    return spans
+
+
+def _routing_audit(routing: DailyRouting, start: date, end: date) -> dict:
+    """Deterministic routing counters for the step/context output. No silent drop."""
+    counts = routing.counts()
+    return {
+        "daily_bars_routing": counts,
+        "audit_findings": [
+            {
+                "dataset": "daily_bars",
+                "severity": "info",
+                "check": "daily_bars_delist_aware_routing",
+                "message": (
+                    f"routed {counts['excluded_expected_no_data']} symbol(s) out of "
+                    f"generic {start.isoformat()}..{end.isoformat()} (expected no data) "
+                    f"and {counts['excluded_delegated_delisted']} symbol(s) to the "
+                    f"dedicated delisted path; {counts['generic_included']} fetched generically"
+                ),
+                "start": start.isoformat(),
+                "end": end.isoformat(),
+                **counts,
+            }
+        ],
+    }
+
+
+def _merge_routing_context(out: dict, routing: DailyRouting, start: date, end: date) -> None:
+    payload = _routing_audit(routing, start, end)
+    existing = out.get("context_updates") or {}
+    existing.setdefault("audit_findings", []).extend(payload["audit_findings"])
+    existing["daily_bars_routing"] = payload["daily_bars_routing"]
+    out["context_updates"] = existing
+
+
+def _resolve_excluded_retry_batch(
+    config: Config,
+    run_id: str,
+    batch_id: str,
+    routing: DailyRouting,
+    start: date,
+    end: date,
+    *,
+    keep_identity: bool,
+) -> None:
+    """Terminally resolve a failed generic batch whose symbols are not generic-owned.
+
+    Uses only manifest APIs — no vendor call, no fabricated rows, no manual
+    SQLite edits. An all-excluded batch keeps its original row (batch identity
+    and symbol provenance) and is marked success with zero rows plus an explicit
+    reason. A mixed batch keeps the original id for its generic subset fetch and
+    records the excluded symbols in a sibling ``-delegated`` batch.
+    """
+    from ashare_lake.orchestrator.manifest import Manifest
+
+    manifest = Manifest(config.manifest_path)
+    reason = (
+        f"ROUTED_OUT_OF_GENERIC expected_no_data={len(routing.excluded_expected_no_data)} "
+        f"delegated_delisted={len(routing.excluded_delegated_delisted)} "
+        f"window={start.isoformat()}..{end.isoformat()}"
+    )
+    if keep_identity:
+        if manifest.get_batch(run_id, batch_id) is None:
+            manifest.start_batch(
+                run_id,
+                batch_id,
+                task_id="daily_bars",
+                dataset="daily_bars",
+                symbols=sorted(routing.excluded),
+                window_start=start.isoformat(),
+                window_end=end.isoformat(),
+            )
+        manifest.finish_batch(
+            run_id,
+            batch_id,
+            "success",
+            rows_read=0,
+            rows_written=0,
+            error_message=reason,
+        )
+        return
+    sibling = f"{batch_id}-delegated"
+    manifest.start_batch(
+        run_id,
+        sibling,
+        task_id="daily_bars",
+        dataset="daily_bars",
+        symbols=sorted(routing.excluded),
+        window_start=start.isoformat(),
+        window_end=end.isoformat(),
+    )
+    manifest.finish_batch(
+        run_id,
+        sibling,
+        "success",
+        rows_read=0,
+        rows_written=0,
+        error_message=reason,
+    )
+
+
 @register_step(
     "daily_bars",
     group="core",
@@ -40,11 +155,34 @@ def step_daily_bars(config: Config, trade_date: date, run_id: str, context: dict
     batch_specs = context.get("_retry_batch_specs")
     if batch_specs:
         # Retry windows are encoded on each BatchSpec; tip/multi-day gap-fill
-        # still applies using the outer trade_date / per-spec window.
+        # still applies using the outer trade_date / per-spec window. The same
+        # delist-aware contract applies: only symbols still active through each
+        # spec's window are generic-owned; A/B symbols are resolved through the
+        # explicit delegated/expected-no-data manifest semantic below.
         windows = {(s, e) for _, _, s, e in batch_specs}
         start = min(s for s, _ in windows)
         end = max(e for _, e in windows)
-        expected = [sym for _, syms, _, _ in batch_specs for sym in syms]
+        spans = _instrument_spans(config)
+        remaining: list[tuple[str, list[str], date, date]] = []
+        combined = DailyRouting()
+        for batch_id, syms, spec_start, spec_end in batch_specs:
+            routing = classify_daily_routing(syms, spans, spec_start, spec_end)
+            combined.included.extend(routing.included)
+            combined.excluded_expected_no_data.extend(routing.excluded_expected_no_data)
+            combined.excluded_delegated_delisted.extend(routing.excluded_delegated_delisted)
+            combined.excluded_future_listing.extend(routing.excluded_future_listing)
+            if routing.included:
+                remaining.append((batch_id, routing.included, spec_start, spec_end))
+            if routing.excluded:
+                _resolve_excluded_retry_batch(
+                    config,
+                    run_id,
+                    batch_id,
+                    routing,
+                    spec_start,
+                    spec_end,
+                    keep_identity=not routing.included,
+                )
         result = fetch_daily_bars_parallel(
             config,
             [],
@@ -52,18 +190,20 @@ def step_daily_bars(config: Config, trade_date: date, run_id: str, context: dict
             end,
             run_id,
             "daily_bars",
-            batch_specs=batch_specs,
+            batch_specs=remaining,
         )
-        return _finish_daily_bars(
+        out = _finish_daily_bars(
             config,
             trade_date,
             run_id,
             start=start,
             end=end,
-            expected_tdx_symbols=list(dict.fromkeys(expected)),
+            expected_tdx_symbols=list(dict.fromkeys(combined.included)),
             tdx_result=result,
             sina_result=None,
         )
+        _merge_routing_context(out, combined, start, end)
+        return out
 
     symbols = load_symbols(config)
     rebackfill = context.get("symbols_to_rebackfill") or []
@@ -76,11 +216,14 @@ def step_daily_bars(config: Config, trade_date: date, run_id: str, context: dict
         start = incremental_window(config, "daily_bars", trade_date)
         end = trade_date
 
+    routing = classify_daily_routing(symbols, _instrument_spans(config), start, end)
+    generic_symbols = routing.included
+
     # TDX has no Beijing exchange route at all — the protocol rejects the market id —
     # so BJ symbols must come from the fallback vendor or they silently never
     # arrive, which is exactly how the lake ended up with zero BJ coverage.
     # Tip gaps after TDX are a second routing case (ADR-0005): EastMoney clist.
-    tdx_symbols, fallback_symbols = split_by_quote_source(symbols)
+    tdx_symbols, fallback_symbols = split_by_quote_source(generic_symbols)
     result = fetch_daily_bars_parallel(
         config,
         tdx_symbols,
@@ -94,7 +237,7 @@ def step_daily_bars(config: Config, trade_date: date, run_id: str, context: dict
         sina_result = fetch_bars_via_sina(
             config, fallback_symbols, start, end, run_id, batch_prefix="sina"
         )
-    return _finish_daily_bars(
+    out = _finish_daily_bars(
         config,
         trade_date,
         run_id,
@@ -104,6 +247,8 @@ def step_daily_bars(config: Config, trade_date: date, run_id: str, context: dict
         tdx_result=result,
         sina_result=sina_result,
     )
+    _merge_routing_context(out, routing, start, end)
+    return out
 
 
 def _finish_daily_bars(

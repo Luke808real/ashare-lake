@@ -36,7 +36,6 @@ import polars as pl
 
 from ashare_lake.config import Config
 from ashare_lake.domain.symbols import issued_code_space
-from ashare_lake.steps.common import load_symbols
 
 logger = logging.getLogger(__name__)
 
@@ -135,9 +134,34 @@ def load_live_missing(config: Config) -> dict[str, date]:
     return classify_catalog(config)[1]
 
 
+def _live_symbols(config: Config) -> set[str]:
+    """Instruments still trading as of the lake's reference date.
+
+    A code with a historical ``delist_date`` is NOT live merely because an
+    instruments row exists — masking it would keep it out of the discovery
+    sweep forever, which is survivorship bias at the catalogue level. Only rows
+    with no ``delist_date`` or one after the reference date count as live.
+    """
+    from ashare_lake.steps.common import instrument_metadata
+
+    meta = instrument_metadata(config)
+    if meta.is_empty():
+        # No instruments on disk yet: fall back to the historic universe
+        # semantics (nothing is provably delisted, so everything is live).
+        from ashare_lake.steps.common import load_symbols
+
+        return set(load_symbols(config))
+    ref = _reference_date(config)
+    return set(
+        meta.filter(
+            pl.col("delist_date").is_null() | (pl.col("delist_date") > ref)
+        )["symbol"].to_list()
+    )
+
+
 def pending_codes(config: Config) -> list[str]:
     """Issued codes neither listed today nor already classified by a prior sweep."""
-    live = set(load_symbols(config))
+    live = _live_symbols(config)
     catalog = _read_catalog(config)
     done = set(catalog["delisted"]) | set(catalog["never_issued"])
     return [s for s in issued_code_space() if s not in live and s not in done]
