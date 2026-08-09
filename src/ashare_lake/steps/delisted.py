@@ -158,9 +158,57 @@ def load_live_missing(config: Config) -> dict[str, date]:
     return classify_catalog(config)[1]
 
 
+def _live_symbols(config: Config) -> set[str]:
+    """Instruments still trading as of the lake's reference date.
+
+    A code with a historical ``delist_date`` is NOT live merely because an
+    instruments row exists — masking it would keep it out of the discovery
+    sweep forever, which is survivorship bias at the catalogue level. Only rows
+    with no ``delist_date`` or one after the reference date count as live.
+    """
+    from ashare_lake.steps.common import instrument_metadata
+
+    meta = instrument_metadata(config)
+    if meta.is_empty():
+        # No instruments on disk yet: fall back to the historic universe
+        # semantics (nothing is provably delisted, so everything is live).
+        from ashare_lake.steps.common import load_symbols
+
+        return set(load_symbols(config))
+    ref = _reference_date(config)
+    return set(
+        meta.filter(
+            pl.col("delist_date").is_null() | (pl.col("delist_date") > ref)
+        )["symbol"].to_list()
+    )
+
+
+def known_delisted_instruments(config: Config, as_of: date) -> dict[str, date]:
+    """Instrument-authoritative delistings: ``symbol -> formal delist_date``.
+
+    Source B of the recency contract. ``instruments.delist_date`` is the formal
+    exchange delisting date (baostock ``outDate`` for merged delisted names,
+    bar-derived spans for the dedicated Sina recovery path) — not a probe
+    ``last_seen``. A formal date on or before *as_of* is decisive: the symbol
+    stopped trading and must not be treated as live merely because a probe has
+    not aged past ``LIVE_RECENCY_DAYS`` yet.
+    """
+    from ashare_lake.steps.common import instrument_metadata
+
+    meta = instrument_metadata(config)
+    if meta.is_empty() or "delist_date" not in meta.columns:
+        return {}
+    out: dict[str, date] = {}
+    for row in meta.filter(pl.col("delist_date").is_not_null()).iter_rows(named=True):
+        formal = row["delist_date"]
+        if formal <= as_of:
+            out[row["symbol"]] = formal
+    return out
+
+
 def pending_codes(config: Config) -> list[str]:
     """Issued codes neither listed today nor already classified by a prior sweep."""
-    live = set(load_symbols(config))
+    live = _live_symbols(config)
     catalog = _read_catalog(config)
     done = set(catalog["delisted"]) | set(catalog["never_issued"])
     return [s for s in issued_code_space() if s not in live and s not in done]
@@ -393,6 +441,13 @@ def delisted_coverage_report(
     already listed during the requested window. If no bar establishes that
     overlap, the name is reported as ``unknown_overlap`` instead of being
     silently treated as out of scope.
+
+    Ownership closure: every symbol the *formal* instrument metadata says
+    delisted on/before ``end`` must end in an explicit state. Formal
+    ``instruments.delist_date`` is decisive even while its probe evidence is
+    still inside ``LIVE_RECENCY_DAYS`` (known delisting), and probe-only recent
+    terminals overlapping the window keep the report fail-closed
+    (``recent_quarantined``) instead of letting coverage silently pass.
     """
     end = end or _reference_date(config)
     if start > end:
@@ -490,6 +545,55 @@ def delisted_coverage_report(
             )
 
     pending = pending_codes(config)
+    # Recency/identity closure (Source A vs Source B of the recency contract).
+    known = known_delisted_instruments(config, end)
+    known_in_window = {symbol: formal for symbol, formal in known.items() if formal >= start}
+    raw_catalog = _read_catalog(config)["delisted"]
+    live_missing = classify_catalog(config)[1]
+
+    expected_no_data = [
+        {"symbol": symbol, "delist_date": formal.isoformat()}
+        for symbol, formal in sorted(known.items())
+        if formal < start
+    ]
+    recent_quarantined: list[dict] = []
+    for symbol, last in sorted(live_missing.items()):
+        if last >= start and symbol not in known_in_window:
+            recent_quarantined.append(
+                {
+                    "symbol": symbol,
+                    "probe_last_traded": last.isoformat(),
+                    "basis": "probe_only",
+                }
+            )
+    unreconciled: list[dict] = []
+    for symbol, formal in sorted(known_in_window.items()):
+        if symbol in candidates:
+            continue  # the main loop above owns the full evidence check
+        if symbol in live_missing:
+            recent_quarantined.append(
+                {
+                    "symbol": symbol,
+                    "formal_delist_date": formal.isoformat(),
+                    "probe_last_traded": live_missing[symbol].isoformat(),
+                    "basis": "known_delisted_quarantined",
+                }
+            )
+        else:
+            raw_last = raw_catalog.get(symbol)
+            unreconciled.append(
+                {
+                    "symbol": symbol,
+                    "formal_delist_date": formal.isoformat(),
+                    **({"catalog_last_traded": raw_last} if raw_last is not None else {}),
+                    "reason": (
+                        "catalog_terminal_before_window_conflicts_with_formal"
+                        if raw_last is not None
+                        else "not_discovered"
+                    ),
+                }
+            )
+
     known_coverage_complete = not any(
         (
             missing_bars,
@@ -497,6 +601,8 @@ def delisted_coverage_report(
             terminal_mismatches,
             missing_instruments,
             invalid_delist_dates,
+            recent_quarantined,
+            unreconciled,
         )
     )
     discovery_complete = not pending
@@ -515,6 +621,11 @@ def delisted_coverage_report(
             "catalogue_candidates": len(candidates),
             "proven_overlap": proven_overlap,
             "pending_probe": len(pending),
+            "known_delisted_instruments": len(known),
+            "known_delisted_in_window": len(known_in_window),
+            "expected_no_data": len(expected_no_data),
+            "recent_quarantined": len(recent_quarantined),
+            "known_delisted_unreconciled": len(unreconciled),
             "missing_bars": len(missing_bars),
             "unknown_overlap": len(unknown_overlap),
             "terminal_mismatch": len(terminal_mismatches),
@@ -523,6 +634,9 @@ def delisted_coverage_report(
         },
         "samples": {
             "pending_probe": limited(pending),
+            "expected_no_data": limited(expected_no_data),
+            "recent_quarantined": limited(recent_quarantined),
+            "known_delisted_unreconciled": limited(unreconciled),
             "missing_bars": limited(missing_bars),
             "unknown_overlap": limited(unknown_overlap),
             "terminal_mismatch": limited(terminal_mismatches),

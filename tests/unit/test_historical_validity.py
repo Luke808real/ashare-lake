@@ -43,6 +43,8 @@ def _survivorship(*, verified: bool) -> dict:
         "verified": verified,
         "counts": {
             "pending_probe": 0 if verified else 2,
+            "recent_quarantined": 0,
+            "known_delisted_unreconciled": 0,
             "missing_bars": 0,
             "unknown_overlap": 0,
             "terminal_mismatch": 0,
