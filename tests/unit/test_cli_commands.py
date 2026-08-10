@@ -661,7 +661,7 @@ def test_delisted_backfill(cfg_path, monkeypatch):
             self.manifest = FakeManifest()
 
         def run_step(self, name, trade_date, run_id):
-            return {"rows_written": 4}
+            return {"status": "success", "rows_written": 4}
 
     monkeypatch.setattr("ashare_lake.cli.main.JobEngine", FakeEngine)
     monkeypatch.setattr(

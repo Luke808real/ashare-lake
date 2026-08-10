@@ -362,7 +362,12 @@ def _would_be_superseded(batches: list[dict]) -> set[str]:
 
 
 def test_real_run_readonly_ledger_replay(tmp_path):
-    """Read-only replay of run 0280a169 with the patched ledger semantics."""
+    """Read-only replay of run 0280a169 with the patched ledger semantics.
+
+    The real run has already been ledger-reconciled (old orphan batch is
+    explicitly ``superseded``, run status success), so the replay must find
+    zero unresolved batches and every step currently successful.
+    """
     if not __import__("os").path.exists(REAL_MANIFEST):
         pytest.skip("real shared manifest not present")
     conn = sqlite3.connect(f"file:{REAL_MANIFEST}?mode=ro", uri=True)
@@ -382,8 +387,10 @@ def test_real_run_readonly_ledger_replay(tmp_path):
     superseded = _would_be_superseded(batches)
     old_incomplete = sum(1 for b in batches if b["status"] not in ("success", "superseded"))
     true_unresolved = old_incomplete - len(superseded)
-    assert old_incomplete == 1, batches
+    assert any(b["status"] == "superseded" for b in batches), batches
+    assert old_incomplete == 0, batches
     assert true_unresolved == 0, batches
+    assert run["status"] == "success"
 
     expected_steps = [
         "instruments",
