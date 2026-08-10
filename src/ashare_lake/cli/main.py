@@ -780,7 +780,12 @@ def backfill(
     _guard_history_horizon(dataset, start_d)
     if symbols_str:
         symbols = [s.strip().upper() for s in symbols_str.split(",") if s.strip()]
-        _override_scope(cfg, dataset, symbols)
+        if dataset == "trading_status":
+            # Historical ST backfill takes a transient symbol scope (the
+            # step's own checkpoint is scope-aware); no config block needed.
+            cfg._backfill_symbols = symbols
+        else:
+            _override_scope(cfg, dataset, symbols)
         click.echo(f"[{dataset}] scope overridden for this run: {len(symbols)} symbol(s)", err=True)
     if start_d:
         cfg._backfill_start = start_d
