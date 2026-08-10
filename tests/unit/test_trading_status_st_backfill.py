@@ -353,3 +353,189 @@ def test_scope_checkpoint_file_is_per_scope(tmp_path, monkeypatch):
     assert payload["end"] == "2026-08-07"
     assert payload["symbol_hash"]
     assert payload["completed"] == ["600000.SH"]
+
+
+def _orchestrated(cfg, monkeypatch, returns):
+    """Engine-level backfill + CLI finish (compact + finish_run), fetch stubbed."""
+    from ashare_lake.cli.main import _finish_backfill_run
+    from ashare_lake.orchestrator.engine import JobEngine
+
+    calls: list[tuple] = []
+
+    def fake_fetch(symbols, start, end, **kwargs):
+        calls.append((list(symbols), start, end))
+        df, failed = returns
+        return df, failed
+
+    monkeypatch.setattr("ashare_lake.adapters.baostock.st_history.fetch_st_history", fake_fetch)
+    engine = JobEngine(cfg)
+    result = engine.run_job(
+        "backfill",
+        steps=["trading_status"],
+        backfill=True,
+        finalize_run=False,
+    )
+    out = _finish_backfill_run(engine, result)
+    return out, calls, engine
+
+
+def _orchestrated_cfg(tmp_path, symbols, **attrs):
+    cfg = _scope_cfg(tmp_path, symbols, **attrs)
+    from ashare_lake.storage.layout import init_data_layout
+
+    init_data_layout(cfg)
+    return cfg
+
+
+def test_orchestration_all_success(tmp_path, monkeypatch):
+    cfg = _orchestrated_cfg(
+        tmp_path,
+        ["600000.SH"],
+        _backfill_start=date(2026, 3, 30),
+        _backfill_end=date(2026, 8, 7),
+        _backfill_symbols=["600000.SH"],
+    )
+    df = pl.DataFrame([_st_row("600000.SH", date(2026, 5, 6))])
+
+    out, _calls, engine = _orchestrated(cfg, monkeypatch, returns=(df, []))
+
+    assert out["status"] == "success"
+    assert out["compact"]["status"] == "success"
+    assert engine.manifest.get_run(out["run_id"])["status"] == "success"
+
+
+def test_orchestration_partial_failure_warns_and_compacts(tmp_path, monkeypatch):
+    cfg = _orchestrated_cfg(
+        tmp_path,
+        ["600000.SH", "000001.SZ"],
+        _backfill_start=date(2026, 3, 30),
+        _backfill_end=date(2026, 8, 7),
+        _backfill_symbols=["600000.SH", "000001.SZ"],
+    )
+    df = pl.DataFrame([_st_row("600000.SH", date(2026, 5, 6))])
+
+    out, _calls, engine = _orchestrated(cfg, monkeypatch, returns=(df, ["000001.SZ"]))
+
+    assert out["status"] == "warning"
+    assert out["results"][0]["status"] == "warning"
+    assert out["results"][0]["failed_symbols"] == 1
+    assert out["compact"]["status"] == "success"  # partial success still compacted
+    assert engine.manifest.get_run(out["run_id"])["status"] == "warning"
+    # Successful row reached curated via compact.
+    files = list((cfg.curated_root / "trading_status").rglob("*.parquet"))
+    assert files
+    curated = pl.read_parquet(files[0])
+    assert curated["symbol"].to_list() == ["600000.SH"]
+
+
+def test_orchestration_partial_failure_resume(tmp_path, monkeypatch):
+    cfg = _orchestrated_cfg(
+        tmp_path,
+        ["600000.SH", "000001.SZ"],
+        _backfill_start=date(2026, 3, 30),
+        _backfill_end=date(2026, 8, 7),
+        _backfill_symbols=["600000.SH", "000001.SZ"],
+    )
+    df = pl.DataFrame([_st_row("600000.SH", date(2026, 5, 6))])
+
+    first, calls, engine = _orchestrated(cfg, monkeypatch, returns=(df, ["000001.SZ"]))
+    assert first["status"] == "warning"
+
+    second, calls2, engine2 = _orchestrated(cfg, monkeypatch, returns=(df, []))
+    assert second["status"] == "success"
+    assert set(calls2[-1][0]) == {"000001.SZ"}  # only the failed symbol re-queried
+    assert engine2.manifest.get_run(second["run_id"])["status"] == "success"
+
+
+def test_orchestration_zero_st_success_no_warning(tmp_path, monkeypatch):
+    cfg = _orchestrated_cfg(
+        tmp_path,
+        ["600000.SH"],
+        _backfill_start=date(2026, 3, 30),
+        _backfill_end=date(2026, 8, 7),
+        _backfill_symbols=["600000.SH"],
+    )
+    out, _calls, engine = _orchestrated(cfg, monkeypatch, returns=(pl.DataFrame(), []))
+
+    assert out["status"] == "success"
+    assert engine.manifest.get_run(out["run_id"])["status"] == "success"
+
+
+def test_orchestration_all_symbols_failed_warns_and_stays_retryable(tmp_path, monkeypatch):
+    cfg = _orchestrated_cfg(
+        tmp_path,
+        ["600000.SH", "000001.SZ"],
+        _backfill_start=date(2026, 3, 30),
+        _backfill_end=date(2026, 8, 7),
+        _backfill_symbols=["600000.SH", "000001.SZ"],
+    )
+    out, _calls, engine = _orchestrated(
+        cfg, monkeypatch, returns=(pl.DataFrame(), ["600000.SH", "000001.SZ"])
+    )
+
+    assert out["status"] == "warning"
+    assert out["results"][0]["failed_symbols"] == 2
+    assert engine.manifest.get_run(out["run_id"])["status"] == "warning"
+    assert _st_completed_symbols(cfg, out["results"][0]["scope_id"]) == set()  # all retryable
+
+
+def test_cli_partial_failure_exits_nonzero(tmp_path, monkeypatch):
+    """End-to-end CLI: partial ST failure -> JSON status warning + exit 1."""
+    from click.testing import CliRunner
+
+    from ashare_lake.cli.main import cli
+    from ashare_lake.config.bootstrap import path_for_toml
+
+    cfg_path = tmp_path / "test.toml"
+    cfg_path.write_text(
+        f"""
+[data]
+root = "{path_for_toml(tmp_path / "data")}"
+
+[orchestrator]
+workers = 1
+
+[tdx_protocol]
+allow_mock = true
+
+[[job.daily.waves]]
+name = "bars"
+parallel = false
+steps = ["daily_bars"]
+"""
+    )
+    _orchestrated_cfg(
+        tmp_path,
+        ["600000.SH", "000001.SZ"],
+        _backfill_start=date(2026, 3, 30),
+        _backfill_end=date(2026, 8, 7),
+        _backfill_symbols=["600000.SH", "000001.SZ"],
+    )
+    df = pl.DataFrame([_st_row("600000.SH", date(2026, 5, 6))])
+
+    def fake_fetch(symbols, start, end, **kwargs):
+        return df, ["000001.SZ"]
+
+    monkeypatch.setattr("ashare_lake.adapters.baostock.st_history.fetch_st_history", fake_fetch)
+    result = CliRunner().invoke(
+        cli,
+        [
+            "backfill",
+            "trading_status",
+            "--config",
+            str(cfg_path),
+            "--start",
+            "2026-03-30",
+            "--end",
+            "2026-08-07",
+            "--symbols",
+            "600000.SH,000001.SZ",
+        ],
+    )
+
+    assert result.exit_code != 0
+    payload = json.loads(
+        result.output[result.output.rindex("\n{") + 1 : result.output.rindex("}") + 1]
+    )
+    assert payload["status"] == "warning"
+    assert payload["results"][0]["failed_symbols"] == 1

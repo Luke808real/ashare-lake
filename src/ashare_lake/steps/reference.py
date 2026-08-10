@@ -480,6 +480,11 @@ def _backfill_trading_status_st(config: Config, trade_date: date, run_id: str) -
         "scope_end": scope["end"],
     }
     if all_failed:
+        # Partial provider failures are truthfully a WARNING: the successful
+        # symbols' staging must still be compacted (the engine/CLI compact on
+        # warning too), the run must not report success, and the failed
+        # symbols stay out of the checkpoint (retryable).
+        result["status"] = "warning"
         result["failed_symbols"] = len(all_failed)
         finding = {
             "dataset": "trading_status",
