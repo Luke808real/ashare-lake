@@ -8,9 +8,14 @@ look-ahead bias (``universe="all_a"`` does not drop names that were ST then).
 Baostock's k-data carries a per-day ``isST`` flag back to 2016, so a per-symbol
 sweep reconstructs the historical ST label. ``isST`` is binary — it does not
 split "ST" from "*ST" — so every ST day maps to ``status="st"``; that is enough
-for the universe filter (``EXCLUDED_STATUSES`` covers both). Only genuinely
-traded ST days are emitted (``tradestatus == 1``); suspension is reconstructed
-separately from bar gaps, so this path stays purely about the ST label.
+for the universe filter (``EXCLUDED_STATUSES`` covers both). Every genuinely
+traded day is emitted: ``status="st"`` when ``isST == 1`` and
+``status="normal"`` when ``isST == 0`` — the negative evidence makes a swept
+non-ST day query-visible instead of indistinguishable from "never checked".
+Suspension is reconstructed separately from bar gaps, so this path emits NO
+rows for non-trading days (``tradestatus != 1``) and stays purely about the ST
+label. Malformed ``isST`` values fail the symbol closed rather than degrading
+to ``normal``.
 """
 
 from __future__ import annotations
@@ -40,10 +45,11 @@ _OUTPUT_SCHEMA = {
 
 
 def _fetch_one_st(bs, symbol: str, start: date, end: date) -> list[dict] | None:
-    """ST-day rows for one symbol, or ``None`` on a retryable query error.
+    """Trading-day rows (st/normal) for one symbol, or ``None`` on failure.
 
-    An ``error_code == '0'`` result with no ST days is a legitimate empty
-    (the name was simply never ST in the window) and returns ``[]``.
+    ``None`` means a retryable provider/symbol failure (query error OR a
+    malformed ``isST`` value — never silently treated as normal). A symbol
+    with no trading days returns ``[]``.
     """
     rs = bs.query_history_k_data_plus(
         to_baostock_symbol(symbol),
@@ -58,14 +64,20 @@ def _fetch_one_st(bs, symbol: str, start: date, end: date) -> list[dict] | None:
     out: list[dict] = []
     while rs.next():
         trade_raw, _code, tradestatus, is_st = rs.get_row_data()
-        if is_st != "1" or tradestatus != "1":
+        if tradestatus != "1":
+            # Non-trading / suspended days are owned by the derived bar-gap
+            # suspension path; Baostock must not emit rows for them.
             continue
+        if is_st not in ("0", "1"):
+            # Malformed/unexpected vocabulary: fail the symbol closed instead
+            # of silently recording a normal day.
+            return None
         out.append(
             {
                 "symbol": symbol,
                 "trade_date": date.fromisoformat(trade_raw),
                 "is_trading": True,
-                "status": "st",
+                "status": "st" if is_st == "1" else "normal",
             }
         )
     return out
@@ -80,12 +92,13 @@ def fetch_st_history(
     sleep=time.sleep,
     config=None,
 ) -> tuple[pl.DataFrame, list[str]]:
-    """Per-symbol historical ST-labelled trading_status rows over ``[start, end]``.
+    """Per-symbol historical trading_status rows over ``[start, end]``.
 
     Returns ``(dataframe, failed_symbols)``. Fail-loud on login failure; each
     symbol is retried with a fresh session + backoff and the still-failing ones
-    are returned so the caller can surface them and resume. A symbol that was
-    never ST contributes zero rows (a legitimate empty, not a failure).
+    are returned so the caller can surface them and resume. A symbol with no
+    trading days contributes zero rows; a traded never-ST symbol contributes
+    ``normal`` rows (negative evidence) — neither is a failure.
 
     ``bs`` / ``sleep`` / ``config`` are injectable for offline tests. Pass
     ``config`` in production for ``[sources.baostock]`` pacing.
