@@ -337,7 +337,9 @@ def delisted_backfill_targets(config: Config, start: date, as_of: date) -> list[
     same ownership contract. A symbol is a recovery target when EITHER:
 
     * FORMAL — ``instruments.delist_date`` is on/before *as_of* (known
-      delisting, decisive) and on/after *start*; or
+      delisting, decisive identity) and on/after *start*, UNLESS an
+      authoritative catalogue terminal proves it stopped trading before
+      ``start`` — formal identity does not by itself prove window overlap; or
     * UNAMBIGUOUS_CATALOG — the probe catalogue classifies it as genuinely
       delisted with ``last_traded >= start``.
 
@@ -352,9 +354,13 @@ def delisted_backfill_targets(config: Config, start: date, as_of: date) -> list[
         for symbol, formal in known_delisted_instruments(config, as_of).items()
         if formal >= start
     }
-    catalog = {symbol for symbol, last in load_delisted_catalog(config).items() if last >= start}
+    catalog = load_delisted_catalog(config)
+    # A formal candidate whose catalogue terminal is before the window has no
+    # trading overlap: expected-no-data, not a recovery target.
+    formal -= {symbol for symbol, last in catalog.items() if last < start}
+    catalog_in_window = {symbol for symbol, last in catalog.items() if last >= start}
     already = _ingested_symbols(config)
-    return sorted(s for s in formal | catalog if s not in already)
+    return sorted(s for s in formal | catalog_in_window if s not in already)
 
 
 def _instruments_rows(config: Config, spans: dict[str, tuple[date | None, date]]) -> pl.DataFrame:
@@ -420,6 +426,19 @@ def _instruments_rows(config: Config, spans: dict[str, tuple[date | None, date]]
     return pl.concat([live, recovered], how="diagonal_relaxed").unique(
         subset=["symbol"], keep="first"
     )
+
+
+def _record_catalog_terminal(config: Config, symbol: str, last_traded: date) -> None:
+    """Persist a probed last-traded terminal via the atomic catalogue store.
+
+    Reuses the existing discovery catalogue semantics (``symbol ->
+    last_traded``): a pre-window terminal makes the symbol expected-no-data for
+    this window, so target selection naturally excludes it on the next run.
+    Only the vendor terminal is stored — never the formal ``delist_date``.
+    """
+    catalog = _read_catalog(config)
+    catalog["delisted"][symbol] = last_traded.isoformat()
+    _write_catalog(config, catalog)
 
 
 def _bar_spans(
@@ -611,10 +630,38 @@ def delisted_coverage_report(
         for symbol, formal in sorted(known_in_window.items())
         if symbol in live_missing
     ]
+    # Window-overlap closure: formal identity (``delist_date``) does NOT by
+    # itself prove overlap with ``[start, end]`` — the last-traded authority
+    # decides. Observed in-window bars prove overlap (even with no catalogue);
+    # a catalogue terminal before ``start`` proves no overlap
+    # (expected-no-data); anything else is unresolved and fails closed.
+    formal_no_overlap: list[dict] = []
     unreconciled: list[dict] = []
     for symbol, formal in sorted(known_in_window.items()):
-        if symbol in candidates or symbol in live_missing:
+        if symbol in candidates:
             continue  # the main loop above owns the full evidence check
+        cat_last = catalog.get(symbol)
+        if cat_last is not None and cat_last < start:
+            formal_no_overlap.append(
+                {
+                    "symbol": symbol,
+                    "formal_delist_date": formal.isoformat(),
+                    "catalog_last_traded": cat_last.isoformat(),
+                }
+            )
+            continue
+        span = spans.get(symbol)
+        if span is not None:
+            continue  # observed bars prove overlap (counted below)
+        if symbol in live_missing:
+            missing_bars.append(
+                {
+                    "symbol": symbol,
+                    "formal_delist_date": formal.isoformat(),
+                    "catalog_last_traded": None,
+                }
+            )
+            continue
         raw_last = raw_catalog.get(symbol)
         unreconciled.append(
             {
@@ -628,22 +675,16 @@ def delisted_coverage_report(
                 ),
             }
         )
-    # Formal-only targets (quarantined at catalogue level): bars are required,
-    # recovered bars prove the overlap, and a bar after the formal delisting
-    # date contradicts identity.
+    # Formal-only symbols with observed bars: proven overlap + identity check.
     for symbol, formal in sorted(known_in_window.items()):
         if symbol in candidates:
             continue
+        cat_last = catalog.get(symbol)
+        if cat_last is not None and cat_last < start:
+            continue  # expected-no-data, handled above
         span = spans.get(symbol)
         if span is None:
-            missing_bars.append(
-                {
-                    "symbol": symbol,
-                    "formal_delist_date": formal.isoformat(),
-                    "catalog_last_traded": None,
-                }
-            )
-            continue
+            continue  # handled above (missing_bars / unreconciled)
         proven_overlap += 1
         actual = instrument_dates.get(symbol)
         if actual is None or actual < span[1]:
@@ -685,6 +726,9 @@ def delisted_coverage_report(
             "pending_probe": len(pending),
             "known_delisted_instruments": len(known),
             "known_delisted_in_window": len(known_in_window),
+            "known_formal_candidates": len(known_in_window),
+            "known_overlap_required": len(known_in_window) - len(formal_no_overlap),
+            "formal_no_overlap": len(formal_no_overlap),
             "expected_no_data": len(expected_no_data),
             "recent_quarantined": len(recent_quarantined),
             "catalog_recent_quarantined": len(catalog_recent_quarantined),
@@ -698,6 +742,7 @@ def delisted_coverage_report(
         "samples": {
             "pending_probe": limited(pending),
             "expected_no_data": limited(expected_no_data),
+            "formal_no_overlap": limited(formal_no_overlap),
             "recent_quarantined": limited(recent_quarantined),
             "catalog_recent_quarantined": limited(catalog_recent_quarantined),
             "known_delisted_unreconciled": limited(unreconciled),
@@ -990,6 +1035,7 @@ def backfill_delisted_bars(
     start: date,
     *,
     fetch=None,
+    probe_last=None,
 ) -> dict:
     """Fetch full price history for known-delisted recovery targets and stage it.
 
@@ -1004,21 +1050,24 @@ def backfill_delisted_bars(
     it iterates the symbols present in ``daily_bars``.
 
     Only symbols with actually recovered bars are marked ingested. A raised
-    fetch and an empty response are both unresolved evidence for a recovery
-    target — the symbol stays out of ``delisted_ingested`` and is retried on
-    the next run, surfaced as ``failed_symbols`` / ``empty_symbols`` with a
-    ``delisted_backfill_incomplete`` audit finding.
+    fetch stays unresolved (``failed_symbols``). An empty window fetch is
+    resolved against the Sina last-traded probe: a terminal before ``start`` is
+    ``PROVEN_NO_OVERLAP`` (expected-no-data — persisted to the catalogue, never
+    ingested, not a failure); a missing, contradictory or failing probe stays
+    unresolved (``empty_symbols``). Both unresolved kinds remain retryable and
+    surface a ``delisted_backfill_incomplete`` audit finding.
 
     Staged in chunks so an interrupted multi-hour sweep keeps what it fetched,
     with the per-symbol date spans accumulated across chunks — they are what the
     ``instruments`` rows are built from at the end.
     """
-    from ashare_lake.adapters.sina.bars import fetch_daily_bars_sina
+    from ashare_lake.adapters.sina.bars import fetch_daily_bars_sina, symbol_exists
     from ashare_lake.steps.http_common import write_fetched
 
     fetch = fetch or (
         lambda symbol, client: fetch_daily_bars_sina(symbol, start=start, client=client)
     )
+    probe_last = probe_last or (lambda symbol, client: symbol_exists(symbol, client=client))
     todo = delisted_backfill_targets(config, start, _reference_date(config))
     if not todo:
         return {"rows_read": 0, "rows_written": 0, "note": "no delisted recovery targets to ingest"}
@@ -1026,7 +1075,8 @@ def backfill_delisted_bars(
     logger.info("delisted bars: %d symbol(s) to fetch from %s", len(todo), start.isoformat())
     rows_written = 0
     failed: list[str] = []
-    empty: list[str] = []
+    unresolved: list[str] = []
+    no_overlap: list[str] = []
     spans: dict[str, tuple[date, date]] = {}
     events: list[dict] = []
     pending_frames: list[pl.DataFrame] = []
@@ -1060,11 +1110,40 @@ def backfill_delisted_bars(
                 failed.append(symbol)
                 continue
             if bars.is_empty():
-                # Empty history for a target that provably overlapped the window
-                # is unresolved evidence, not successful ingestion: keep it
-                # retryable and never mark it done.
-                logger.warning("delisted bars: empty response for %s", symbol)
-                empty.append(symbol)
+                # Empty window fetch: distinguish "vendor has no evidence" from
+                # "vendor history exists but ends before the window".
+                try:
+                    last_traded = probe_last(symbol, client)
+                except Exception as exc:  # noqa: BLE001 — probe outage stays retryable
+                    logger.warning("delisted bars: probe failed for %s: %s", symbol, exc)
+                    unresolved.append(symbol)
+                    continue
+                if last_traded is None:
+                    # Formal identity says the security existed, so this is not
+                    # "never issued" — it is unresolved, never-issued must not
+                    # be inferred from a missing probe answer.
+                    logger.warning("delisted bars: no terminal evidence for %s", symbol)
+                    unresolved.append(symbol)
+                    continue
+                if last_traded >= start:
+                    # Vendor claims window overlap but the window fetch was
+                    # empty: contradictory evidence, stay retryable.
+                    logger.warning(
+                        "delisted bars: empty fetch but probe last_traded %s >= start for %s",
+                        last_traded,
+                        symbol,
+                    )
+                    unresolved.append(symbol)
+                    continue
+                # PROVEN_NO_OVERLAP: the vendor's last traded session is before
+                # the window — expected-no-data, resolved, no bars fabricated.
+                logger.info(
+                    "delisted bars: %s last traded %s before window — expected no data",
+                    symbol,
+                    last_traded,
+                )
+                no_overlap.append(symbol)
+                _record_catalog_terminal(config, symbol, last_traded)
                 continue
             pending_frames.append(bars)
             spans[symbol] = (bars["trade_date"].min(), bars["trade_date"].max())
@@ -1097,18 +1176,20 @@ def backfill_delisted_bars(
         "rows_written": rows_written,
         "symbols": len(todo),
         "recovered": len(spans),
+        "no_overlap_symbols": len(no_overlap),
         "ending_patterns": dict(Counter(e["ending_pattern"] for e in events)),
     }
-    if failed or empty:
+    if failed or unresolved:
         result["failed_symbols"] = len(failed)
-        result["empty_symbols"] = len(empty)
+        result["empty_symbols"] = len(unresolved)
         result.setdefault("context_updates", {})["audit_findings"] = [
             {
                 "dataset": "daily_bars",
                 "severity": "warning",
                 "check": "delisted_backfill_incomplete",
                 "message": (
-                    f"{len(failed)} failed / {len(empty)} empty of {len(todo)} "
+                    f"{len(failed)} failed / {len(unresolved)} unresolved empty "
+                    f"of {len(todo)} "
                     "delisted recovery targets; re-run to resume"
                 ),
             }

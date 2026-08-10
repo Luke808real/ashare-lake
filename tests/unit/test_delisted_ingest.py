@@ -166,6 +166,7 @@ def test_a_symbol_with_empty_bars_is_kept_retryable_and_not_ingested(tmp_path):
         "run-1",
         _START,
         fetch=lambda s, c: pl.DataFrame(schema={c: DAILY_BARS_SCHEMA[c] for c in _BAR_COLS}),
+        probe_last=lambda s, c: None,
     )
 
     assert result["recovered"] == 0
@@ -213,6 +214,7 @@ def test_empty_formal_target_kept_retryable(tmp_path):
         "run-1",
         _START,
         fetch=lambda s, c: pl.DataFrame(schema={c: DAILY_BARS_SCHEMA[c] for c in _BAR_COLS}),
+        probe_last=lambda s, c: None,
     )
 
     assert result["empty_symbols"] == 1
@@ -238,7 +240,13 @@ def test_mixed_chunk_preserves_success_and_keeps_empty_exception_retryable(tmp_p
             return pl.DataFrame(schema={c: DAILY_BARS_SCHEMA[c] for c in _BAR_COLS})
         raise ConnectionError("provider down")
 
-    result = backfill_delisted_bars(cfg, "run-1", _START, fetch=mixed)
+    result = backfill_delisted_bars(
+        cfg,
+        "run-1",
+        _START,
+        fetch=mixed,
+        probe_last=lambda s, c: None,
+    )
 
     assert result["recovered"] == 1
     assert result["empty_symbols"] == 1

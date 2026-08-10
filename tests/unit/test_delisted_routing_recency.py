@@ -627,6 +627,7 @@ def test_empty_backfill_stays_fail_closed_and_recoverable(tmp_path, monkeypatch)
         "run-1",
         WINDOW_START,
         fetch=lambda s, c: _empty_bars_frame(),
+        probe_last=lambda s, c: None,
     )
     assert first["empty_symbols"] == 1
     assert first["recovered"] == 0

@@ -37,7 +37,7 @@ allow_mock = true
     return str(path)
 
 
-def _result(*, failed=0, empty=0, recovered=0, rows=0, symbols=0, note=None) -> dict:
+def _result(*, failed=0, empty=0, recovered=0, rows=0, symbols=0, note=None, no_overlap=0) -> dict:
     out = {
         "rows_read": rows,
         "rows_written": rows,
@@ -49,6 +49,8 @@ def _result(*, failed=0, empty=0, recovered=0, rows=0, symbols=0, note=None) -> 
         out["failed_symbols"] = failed
     if empty:
         out["empty_symbols"] = empty
+    if no_overlap:
+        out["no_overlap_symbols"] = no_overlap
     if note:
         out["note"] = note
     return out
@@ -219,4 +221,25 @@ def test_zero_targets_is_success(cfg_path, monkeypatch):
 
     assert exit_code == 0
     assert payload["status"] == "success"
+    assert _run_status(cfg_path, payload["run_id"]) == "success"
+
+
+def test_no_overlap_resolved_is_success_not_failure(cfg_path, monkeypatch):
+    """Proven no-overlap is resolved, not a failure (per window-overlap contract)."""
+    monkeypatch.setattr(
+        delisted_mod,
+        "backfill_delisted_bars",
+        lambda *a, **k: _result(no_overlap=5, symbols=5),
+    )
+    monkeypatch.setattr(
+        JobEngine,
+        "run_step",
+        lambda self, name, trade_date, run_id, context=None: _compact("success"),
+    )
+
+    exit_code, payload = _invoke(cfg_path)
+
+    assert exit_code == 0
+    assert payload["status"] == "success"
+    assert payload["no_overlap_symbols"] == 5
     assert _run_status(cfg_path, payload["run_id"]) == "success"
