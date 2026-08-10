@@ -12,10 +12,13 @@ for the universe filter (``EXCLUDED_STATUSES`` covers both). Every genuinely
 traded day is emitted: ``status="st"`` when ``isST == 1`` and
 ``status="normal"`` when ``isST == 0`` — the negative evidence makes a swept
 non-ST day query-visible instead of indistinguishable from "never checked".
-Suspension is reconstructed separately from bar gaps, so this path emits NO
-rows for non-trading days (``tradestatus != 1``) and stays purely about the ST
-label. Malformed ``isST`` values fail the symbol closed rather than degrading
-to ``normal``.
+An explicit Baostock ``tradestatus == "0"`` day is emitted as
+``status="suspended" / is_trading=false`` — provider-declared no-trade evidence
+(the ``isST`` flag is NOT interpreted on such days; ST stays unknown because
+the day was not tradeable). Suspension continues to be reconstructed from bar
+gaps as well; both paths may cover the same day and compact resolves the PK.
+Malformed ``tradestatus`` / ``isST`` values fail the symbol closed rather than
+degrading to a guessed status. Missing rows are NEVER interpreted as suspended.
 """
 
 from __future__ import annotations
@@ -45,11 +48,12 @@ _OUTPUT_SCHEMA = {
 
 
 def _fetch_one_st(bs, symbol: str, start: date, end: date) -> list[dict] | None:
-    """Trading-day rows (st/normal) for one symbol, or ``None`` on failure.
+    """Trading-day (st/normal) + explicit non-trading (suspended) rows.
 
     ``None`` means a retryable provider/symbol failure (query error OR a
-    malformed ``isST`` value — never silently treated as normal). A symbol
-    with no trading days returns ``[]``.
+    malformed ``tradestatus`` / ``isST`` value — never silently treated as a
+    guessed status). A symbol with no returned rows returns ``[]``; absence of
+    rows is never interpreted as suspension.
     """
     rs = bs.query_history_k_data_plus(
         to_baostock_symbol(symbol),
@@ -64,22 +68,30 @@ def _fetch_one_st(bs, symbol: str, start: date, end: date) -> list[dict] | None:
     out: list[dict] = []
     while rs.next():
         trade_raw, _code, tradestatus, is_st = rs.get_row_data()
-        if tradestatus != "1":
-            # Non-trading / suspended days are owned by the derived bar-gap
-            # suspension path; Baostock must not emit rows for them.
-            continue
-        if is_st not in ("0", "1"):
+        if tradestatus not in ("0", "1") or is_st not in ("0", "1"):
             # Malformed/unexpected vocabulary: fail the symbol closed instead
-            # of silently recording a normal day.
+            # of silently recording a guessed status (st/normal/suspended).
             return None
-        out.append(
-            {
-                "symbol": symbol,
-                "trade_date": date.fromisoformat(trade_raw),
-                "is_trading": True,
-                "status": "st" if is_st == "1" else "normal",
-            }
-        )
+        if tradestatus == "1":
+            out.append(
+                {
+                    "symbol": symbol,
+                    "trade_date": date.fromisoformat(trade_raw),
+                    "is_trading": True,
+                    "status": "st" if is_st == "1" else "normal",
+                }
+            )
+        else:
+            # Provider-declared no-trade day: isST is NOT interpreted here;
+            # the day was not tradeable, so ST stays unknown (is_st=None later).
+            out.append(
+                {
+                    "symbol": symbol,
+                    "trade_date": date.fromisoformat(trade_raw),
+                    "is_trading": False,
+                    "status": "suspended",
+                }
+            )
     return out
 
 

@@ -54,7 +54,7 @@ def _rows(code, days):
     return [[d, code, ts, st] for d, ts, st in days]
 
 
-def test_emits_traded_st_and_normal_days_but_not_suspensions():
+def test_emits_traded_st_normal_and_explicit_nontrading_days():
     bs = _FakeBaostock(
         {
             "sz.000017": _rows(
@@ -62,7 +62,7 @@ def test_emits_traded_st_and_normal_days_but_not_suspensions():
                 [
                     ("2020-04-28", "1", "0"),  # not ST yet
                     ("2020-04-29", "1", "1"),  # ST day -> emitted
-                    ("2020-04-30", "0", "1"),  # ST but suspended -> skipped
+                    ("2020-04-30", "0", "1"),  # ST but suspended -> suspended row
                     ("2020-05-06", "1", "1"),  # ST day -> emitted
                     ("2020-05-07", "1", "0"),  # back to normal -> emitted normal
                 ],
@@ -75,15 +75,16 @@ def test_emits_traded_st_and_normal_days_but_not_suspensions():
 
     assert bs.logged_out is True
     assert failed == []
-    assert df.height == 4
+    assert df.height == 5
     assert df["trade_date"].sort().to_list() == [
         date(2020, 4, 28),
         date(2020, 4, 29),
+        date(2020, 4, 30),
         date(2020, 5, 6),
         date(2020, 5, 7),
     ]
-    assert df["status"].to_list() == ["normal", "st", "st", "normal"]
-    assert df["is_trading"].unique().to_list() == [True]
+    assert df["status"].to_list() == ["normal", "st", "suspended", "st", "normal"]
+    assert df["is_trading"].to_list() == [True, True, False, True, True]
     # columns are the curated trading_status contract minus provenance
     assert set(df.columns) == set(TRADING_STATUS_SCHEMA) - {"source", "data_version", "fetched_at"}
     # rows are unique on the trading_status primary key
@@ -112,8 +113,65 @@ def test_never_st_symbol_now_emits_normal_rows_not_empty():
     assert df["status"].to_list() == ["normal", "normal"]
 
 
-def test_no_trading_days_is_empty_but_not_failure():
+def test_nontrading_day_isST0_emits_suspended():
+    """600081-style explicit no-trade: tradestatus=0 + isST=0 -> suspended."""
+    bs = _FakeBaostock(
+        {
+            "sh.600081": _rows(
+                "sh.600081",
+                [
+                    ("2023-08-08", "0", "0"),
+                    ("2023-08-09", "0", "0"),
+                    ("2023-08-10", "1", "0"),  # resumed
+                ],
+            )
+        }
+    )
+    df, failed = fetch_st_history(
+        ["600081.SH"], date(2023, 8, 1), date(2023, 8, 31), bs=bs, sleep=lambda _: None
+    )
+    assert failed == []
+    assert df.height == 3
+    assert df["status"].to_list() == ["suspended", "suspended", "normal"]
+    assert df["is_trading"].to_list() == [False, False, True]
+
+
+def test_nontrading_day_isST1_emits_suspended_not_st():
+    """000838-style: tradestatus=0 + isST=1 -> suspended, isST NOT interpreted."""
+    bs = _FakeBaostock(
+        {
+            "sz.000838": _rows(
+                "sz.000838",
+                [
+                    ("2026-08-03", "0", "1"),
+                    ("2026-08-04", "0", "1"),
+                    ("2026-08-07", "0", "1"),
+                ],
+            )
+        }
+    )
+    df, failed = fetch_st_history(
+        ["000838.SZ"], date(2026, 8, 1), date(2026, 8, 31), bs=bs, sleep=lambda _: None
+    )
+    assert failed == []
+    assert df.height == 3
+    assert df["status"].to_list() == ["suspended"] * 3
+    assert df["is_trading"].to_list() == [False] * 3
+
+
+def test_no_returned_rows_is_empty_but_not_failure():
     bs = _FakeBaostock({"sz.000001": _rows("sz.000001", [("2020-01-02", "0", "0")])})
+    df, failed = fetch_st_history(
+        ["000001.SZ"], date(2020, 1, 1), date(2020, 12, 31), bs=bs, sleep=lambda _: None
+    )
+    assert failed == []
+    assert df.height == 1
+    assert df["status"].to_list() == ["suspended"]
+
+
+def test_empty_result_set_is_empty_but_not_failure():
+    """A provider that returns zero rows (no k-data) is empty, never suspended."""
+    bs = _FakeBaostock({"sz.000001": []})
     df, failed = fetch_st_history(
         ["000001.SZ"], date(2020, 1, 1), date(2020, 12, 31), bs=bs, sleep=lambda _: None
     )
@@ -129,6 +187,49 @@ def test_malformed_isst_fails_symbol_closed():
     )
     assert df.is_empty()
     assert failed == ["000017.SZ"]
+
+
+def test_malformed_tradestatus_fails_symbol_closed():
+    """Unknown tradestatus vocabulary must NOT silently become normal/suspended."""
+    bs = _FakeBaostock({"sz.000017": _rows("sz.000017", [("2020-04-29", "2", "0")])})
+    df, failed = fetch_st_history(
+        ["000017.SZ"], date(2020, 1, 1), date(2020, 12, 31), bs=bs, sleep=lambda _: None
+    )
+    assert df.is_empty()
+    assert failed == ["000017.SZ"]
+
+
+def test_malformed_isst_on_nontrading_day_fails_symbol_closed():
+    """tradestatus=0 with unexpected isST must fail closed, never guess."""
+    bs = _FakeBaostock({"sz.000017": _rows("sz.000017", [("2020-04-29", "0", "X")])})
+    df, failed = fetch_st_history(
+        ["000017.SZ"], date(2020, 1, 1), date(2020, 12, 31), bs=bs, sleep=lambda _: None
+    )
+    assert df.is_empty()
+    assert failed == ["000017.SZ"]
+
+
+def test_mixed_days_have_unique_primary_keys():
+    """A swept window with st/normal/suspended days must not duplicate PKs."""
+    bs = _FakeBaostock(
+        {
+            "sz.000838": _rows(
+                "sz.000838",
+                [
+                    ("2026-08-03", "0", "1"),
+                    ("2026-08-04", "0", "1"),
+                    ("2026-08-05", "1", "1"),
+                    ("2026-08-06", "1", "0"),
+                ],
+            )
+        }
+    )
+    df, failed = fetch_st_history(
+        ["000838.SZ"], date(2026, 8, 1), date(2026, 8, 31), bs=bs, sleep=lambda _: None
+    )
+    assert failed == []
+    pk = PRIMARY_KEYS["trading_status"]
+    assert df.unique(subset=pk).height == df.height == 4
 
 
 def _status_row(
