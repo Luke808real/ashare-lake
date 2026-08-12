@@ -6,6 +6,8 @@ ashare-lake 是 A 股数据的**采集编排层**：在多个外部数据源之�
 
 运维见 [runbook](../operations/runbook.md)；字段契约见 [schema](../datasets/schema.md)；关键决策见 [ADR](../adr/)。
 
+与下游策略系统的职责边界见 [Plane 边界](plane-boundary.md)：本仓是 Data Plane，只回答市场事实，不包含任何策略语义。
+
 ---
 
 ## 六层设计
