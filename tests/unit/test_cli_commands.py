@@ -57,6 +57,39 @@ def test_config_validate_ok(cfg_path):
     assert "Configuration OK" in result.output
 
 
+def test_backfill_trading_status_accepts_symbol_scope(cfg_path, monkeypatch):
+    """--symbols on trading_status routes into a transient backfill scope."""
+    captured: dict = {}
+
+    def fake_backfill_once(cfg, dataset):
+        captured["symbols"] = getattr(cfg, "_backfill_symbols", None)
+        captured["start"] = getattr(cfg, "_backfill_start", None)
+        captured["end"] = getattr(cfg, "_backfill_end", None)
+        return {"status": "success", "rows_read": 0, "rows_written": 0}
+
+    monkeypatch.setattr("ashare_lake.cli.main._backfill_once", fake_backfill_once)
+    result = CliRunner().invoke(
+        cli,
+        [
+            "backfill",
+            "trading_status",
+            "--config",
+            cfg_path,
+            "--start",
+            "2026-03-30",
+            "--end",
+            "2026-08-07",
+            "--symbols",
+            "600000.SH,000001.SZ",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["symbols"] == ["600000.SH", "000001.SZ"]
+    assert captured["start"] == date(2026, 3, 30)
+    assert captured["end"] == date(2026, 8, 7)
+
+
 def test_config_validate_reports_errors(tmp_path):
     cfg_path = tmp_path / "bad.toml"
     cfg_path.write_text(
@@ -661,7 +694,7 @@ def test_delisted_backfill(cfg_path, monkeypatch):
             self.manifest = FakeManifest()
 
         def run_step(self, name, trade_date, run_id):
-            return {"rows_written": 4}
+            return {"status": "success", "rows_written": 4}
 
     monkeypatch.setattr("ashare_lake.cli.main.JobEngine", FakeEngine)
     monkeypatch.setattr(

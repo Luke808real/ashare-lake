@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import logging
 import os
+import re
 import tempfile
 from datetime import date, timedelta
+from pathlib import Path
 
 import polars as pl
 
@@ -40,6 +43,8 @@ _ST_BACKFILL_STATE = "trading_status_st_backfill"
 # Flush + checkpoint every chunk so a mid-sweep baostock login death does not
 # discard hours of already-fetched ST rows (observed ~2950/5204 lost on one run).
 _ST_BACKFILL_CHUNK = 200
+_ST_SCOPE_VERSION = 1
+_ST_SYMBOL_RE = re.compile(r"^\d{6}(\.(SH|SZ|BJ))?$")
 
 
 @register_step("instruments", group="core", requires_workers=False)
@@ -254,10 +259,11 @@ def step_trading_status(config: Config, trade_date: date, run_id: str, context: 
     )
     if df.is_empty():
         return {"rows_read": 0, "rows_written": 0}
-    if "source" not in df.columns:
-        df = normalize_with_source(df)
-    else:
-        df = with_provenance(df, source="eastmoney", data_version="v1")
+    # EastMoney is the only daily status provider; rows fetched here are
+    # current-state snapshots and must not be stamped as TDX (the dataset's
+    # nominal primary source). Correct provenance matters for the
+    # derived-suspension merge precedence later.
+    df = with_provenance(df.drop("source", strict=False), source="eastmoney", data_version="v1")
     return write_simple(config, run_id, "trading_status", df)
 
 
@@ -273,8 +279,61 @@ def _st_backfill_state_path(config: Config):
     return config.meta_root / "state" / f"{_ST_BACKFILL_STATE}.json"
 
 
+def _st_scope(config: Config, trade_date: date) -> tuple[dict, str | None]:
+    """Resolve the ST backfill scope and its deterministic identity.
+
+    Returns ``(scope, scope_id)`` where ``scope_id`` is None for the LEGACY
+    default scope (BACKFILL_START, default all-A universe) and a SHA-256 of
+    the canonical ``{start, end, symbol_hash}`` payload for any custom scope
+    (explicit ``--start`` / ``--end`` / ``--symbols``). A custom scope's
+    checkpoint can never be confused with another scope's completion state.
+    """
+    start = getattr(config, "_backfill_start", None)
+    end = getattr(config, "_backfill_end", None)
+    explicit = getattr(config, "_backfill_symbols", None)
+    custom = start is not None or end is not None or explicit is not None
+    start_d = start or BACKFILL_START
+    end_d = end or trade_date
+    if start_d > end_d:
+        raise ValueError(
+            f"trading_status ST backfill window inverted: start {start_d} > end {end_d}"
+        )
+    symbol_scope = sorted(set(explicit)) if explicit is not None else None
+    symbol_hash = None
+    if symbol_scope is not None:
+        symbol_hash = hashlib.sha256(
+            json.dumps(symbol_scope, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+    scope = {
+        "scope_version": _ST_SCOPE_VERSION,
+        "start": start_d.isoformat(),
+        "end": end_d.isoformat(),
+        "symbol_hash": symbol_hash,
+    }
+    if not custom:
+        return scope, None
+    scope_id = hashlib.sha256(
+        json.dumps(scope, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return scope, scope_id
+
+
+def _st_scope_checkpoint_path(config: Config, scope_id: str | None) -> Path:
+    """Checkpoint path: legacy file for the default scope, per-scope dir else."""
+    if scope_id is None:
+        return _st_backfill_state_path(config)
+    return config.meta_root / "state" / _ST_BACKFILL_STATE / f"{scope_id}.json"
+
+
 def _st_backfilled_symbols(config: Config) -> set[str]:
     path = _st_backfill_state_path(config)
+    if not path.exists():
+        return set()
+    return set(json.loads(path.read_text(encoding="utf-8")).get("completed", []))
+
+
+def _st_completed_symbols(config: Config, scope_id: str | None) -> set[str]:
+    path = _st_scope_checkpoint_path(config, scope_id)
     if not path.exists():
         return set()
     return set(json.loads(path.read_text(encoding="utf-8")).get("completed", []))
@@ -296,8 +355,62 @@ def _mark_st_backfilled(config: Config, symbols: list[str]) -> None:
         raise
 
 
+def _mark_st_completed(
+    config: Config,
+    scope_id: str | None,
+    scope: dict,
+    symbols: list[str],
+) -> None:
+    """Atomically checkpoint ``symbols`` for one explicit ST backfill scope."""
+    path = _st_scope_checkpoint_path(config, scope_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    completed = sorted(_st_completed_symbols(config, scope_id) | set(symbols))
+    payload = dict(scope)
+    payload["completed"] = completed
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.stem}-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+        os.replace(tmp, path)
+    except Exception:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+def _resolve_st_scope_symbols(config: Config, raw: list[str]) -> list[str]:
+    """Normalize and validate an explicit ST symbol scope (fail closed)."""
+    instruments = set(load_symbols(config))
+    resolved: list[str] = []
+    for value in raw:
+        symbol = str(value).strip().upper()
+        if not _ST_SYMBOL_RE.match(symbol):
+            raise ValueError(f"trading_status ST backfill: malformed symbol {value!r}")
+        if "." in symbol:
+            if symbol not in instruments:
+                raise ValueError(f"trading_status ST backfill: unknown instrument {symbol!r}")
+            resolved.append(symbol)
+            continue
+        matches = [s for s in instruments if s.startswith(symbol + ".")]
+        if len(matches) != 1:
+            raise ValueError(
+                f"trading_status ST backfill: cannot resolve {value!r} "
+                f"to exactly one instrument ({len(matches)} found)"
+            )
+        resolved.append(matches[0])
+    return sorted(set(resolved))
+
+
 def _backfill_trading_status_st(config: Config, trade_date: date, run_id: str) -> dict:
     """Historical ST labels from baostock over the all_a universe (2016 → today).
+
+    The sweep window honours the caller's ``_backfill_start`` /
+    ``_backfill_end`` (default: ``BACKFILL_START`` → ``trade_date``), and an
+    explicit ``_backfill_symbols`` scope restricts the universe to exactly
+    those symbols. A custom scope checkpoints under its own deterministic
+    scope identity, so a bounded run can never poison a deeper/full run's
+    resume state; the legacy checkpoint file keeps its meaning for the legacy
+    default scope only.
 
     Fills the ``trading_status`` ST gap so ``universe="all_a"`` excludes names that
     were ST in earlier backtest windows (removes survivorship / look-ahead bias).
@@ -308,7 +421,12 @@ def _backfill_trading_status_st(config: Config, trade_date: date, run_id: str) -
     """
     from ashare_lake.adapters.baostock.st_history import fetch_st_history
 
-    universe = [s for s in load_symbols(config) if _is_all_a(s)]
+    scope, scope_id = _st_scope(config, trade_date)
+    explicit = getattr(config, "_backfill_symbols", None)
+    if explicit is not None:
+        universe = _resolve_st_scope_symbols(config, explicit)
+    else:
+        universe = [s for s in load_symbols(config) if _is_all_a(s)]
     # Only sweep names that have price bars: a delisted symbol still sitting in the
     # instruments list would otherwise cost a baostock round-trip with no bar to
     # join its ST label against. Skip the constraint on a bars-less lake so a
@@ -316,17 +434,27 @@ def _backfill_trading_status_st(config: Config, trade_date: date, run_id: str) -
     bar_universe = load_bar_universe(config)
     if bar_universe:
         universe = [s for s in universe if s in bar_universe]
-    done = _st_backfilled_symbols(config)
+    done = _st_completed_symbols(config, scope_id)
     todo = [s for s in universe if s not in done]
     if not todo:
-        return {"rows_read": 0, "rows_written": 0, "note": "all symbols already ST-backfilled"}
+        return {
+            "rows_read": 0,
+            "rows_written": 0,
+            "note": "all symbols already ST-backfilled",
+            "scope_id": scope_id,
+        }
 
     rows_read = 0
     rows_written = 0
     all_failed: list[str] = []
     for offset in range(0, len(todo), _ST_BACKFILL_CHUNK):
         batch = todo[offset : offset + _ST_BACKFILL_CHUNK]
-        df, failed = fetch_st_history(batch, BACKFILL_START, trade_date, config=config)
+        df, failed = fetch_st_history(
+            batch,
+            date.fromisoformat(scope["start"]),
+            date.fromisoformat(scope["end"]),
+            config=config,
+        )
         if not df.is_empty():
             chunk = write_fetched(
                 config,
@@ -341,11 +469,22 @@ def _backfill_trading_status_st(config: Config, trade_date: date, run_id: str) -
         failed_set = set(failed)
         swept = [s for s in batch if s not in failed_set]
         if swept:
-            _mark_st_backfilled(config, swept)
+            _mark_st_completed(config, scope_id, scope, swept)
         all_failed.extend(failed)
 
-    result: dict = {"rows_read": rows_read, "rows_written": rows_written}
+    result: dict = {
+        "rows_read": rows_read,
+        "rows_written": rows_written,
+        "scope_id": scope_id,
+        "scope_start": scope["start"],
+        "scope_end": scope["end"],
+    }
     if all_failed:
+        # Partial provider failures are truthfully a WARNING: the successful
+        # symbols' staging must still be compacted (the engine/CLI compact on
+        # warning too), the run must not report success, and the failed
+        # symbols stay out of the checkpoint (retryable).
+        result["status"] = "warning"
         result["failed_symbols"] = len(all_failed)
         finding = {
             "dataset": "trading_status",

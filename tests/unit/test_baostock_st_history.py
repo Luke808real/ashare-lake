@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timezone
 
+import polars as pl
 import pytest
 
 from ashare_lake.adapters.baostock.st_history import fetch_st_history
 from ashare_lake.domain.schemas import PRIMARY_KEYS, TRADING_STATUS_SCHEMA
+from ashare_lake.storage import StagingWriter
+from ashare_lake.storage.parquet import compact_dataset
 
 
 class _FakeResultSet:
@@ -51,7 +54,7 @@ def _rows(code, days):
     return [[d, code, ts, st] for d, ts, st in days]
 
 
-def test_emits_only_traded_st_days():
+def test_emits_traded_st_and_normal_days_but_not_suspensions():
     bs = _FakeBaostock(
         {
             "sz.000017": _rows(
@@ -61,6 +64,7 @@ def test_emits_only_traded_st_days():
                     ("2020-04-29", "1", "1"),  # ST day -> emitted
                     ("2020-04-30", "0", "1"),  # ST but suspended -> skipped
                     ("2020-05-06", "1", "1"),  # ST day -> emitted
+                    ("2020-05-07", "1", "0"),  # back to normal -> emitted normal
                 ],
             )
         }
@@ -71,9 +75,14 @@ def test_emits_only_traded_st_days():
 
     assert bs.logged_out is True
     assert failed == []
-    assert df.height == 2
-    assert df["trade_date"].sort().to_list() == [date(2020, 4, 29), date(2020, 5, 6)]
-    assert df["status"].unique().to_list() == ["st"]
+    assert df.height == 4
+    assert df["trade_date"].sort().to_list() == [
+        date(2020, 4, 28),
+        date(2020, 4, 29),
+        date(2020, 5, 6),
+        date(2020, 5, 7),
+    ]
+    assert df["status"].to_list() == ["normal", "st", "st", "normal"]
     assert df["is_trading"].unique().to_list() == [True]
     # columns are the curated trading_status contract minus provenance
     assert set(df.columns) == set(TRADING_STATUS_SCHEMA) - {"source", "data_version", "fetched_at"}
@@ -82,13 +91,116 @@ def test_emits_only_traded_st_days():
     assert df.unique(subset=pk).height == df.height
 
 
-def test_never_st_symbol_is_legit_empty_not_failure():
-    bs = _FakeBaostock({"sz.000001": _rows("sz.000001", [("2020-01-02", "1", "0")])})
+def test_never_st_symbol_now_emits_normal_rows_not_empty():
+    """A swept non-ST traded day is query-visible normal evidence."""
+    bs = _FakeBaostock(
+        {
+            "sz.000001": _rows(
+                "sz.000001",
+                [
+                    ("2020-01-02", "1", "0"),
+                    ("2020-01-03", "1", "0"),
+                ],
+            )
+        }
+    )
+    df, failed = fetch_st_history(
+        ["000001.SZ"], date(2020, 1, 1), date(2020, 12, 31), bs=bs, sleep=lambda _: None
+    )
+    assert failed == []
+    assert df.height == 2
+    assert df["status"].to_list() == ["normal", "normal"]
+
+
+def test_no_trading_days_is_empty_but_not_failure():
+    bs = _FakeBaostock({"sz.000001": _rows("sz.000001", [("2020-01-02", "0", "0")])})
     df, failed = fetch_st_history(
         ["000001.SZ"], date(2020, 1, 1), date(2020, 12, 31), bs=bs, sleep=lambda _: None
     )
     assert failed == []
     assert df.is_empty()
+
+
+def test_malformed_isst_fails_symbol_closed():
+    """Unknown isST vocabulary must NOT silently become normal."""
+    bs = _FakeBaostock({"sz.000017": _rows("sz.000017", [("2020-04-29", "1", "X")])})
+    df, failed = fetch_st_history(
+        ["000017.SZ"], date(2020, 1, 1), date(2020, 12, 31), bs=bs, sleep=lambda _: None
+    )
+    assert df.is_empty()
+    assert failed == ["000017.SZ"]
+
+
+def _status_row(
+    symbol: str,
+    trade_date: date,
+    *,
+    status: str,
+    source: str,
+    fetched_at: datetime,
+) -> dict:
+    return {
+        "symbol": symbol,
+        "trade_date": trade_date,
+        "is_trading": True,
+        "status": status,
+        "source": source,
+        "data_version": "v1",
+        "fetched_at": fetched_at,
+    }
+
+
+def _compact_winner(
+    tmp_path,
+    *,
+    baostock_status: str,
+) -> pl.DataFrame:
+    """Stage a stale tdx current-state row + a new baostock row, compact, read back."""
+    run_id = "run-1"
+    writer = StagingWriter(tmp_path / "staging")
+    stale = pl.DataFrame(
+        [
+            _status_row(
+                "600000.SH",
+                date(2026, 8, 4),
+                status="normal",
+                source="tdx_protocol",
+                fetched_at=datetime(2026, 8, 10, 1, 32, tzinfo=timezone.utc),
+            )
+        ]
+    )
+    fresh = pl.DataFrame(
+        [
+            _status_row(
+                "600000.SH",
+                date(2026, 8, 4),
+                status=baostock_status,
+                source="baostock",
+                fetched_at=datetime(2026, 8, 10, 13, 0, tzinfo=timezone.utc),
+            )
+        ]
+    )
+    writer.write_batch("trading_status", run_id, "stale", stale)
+    writer.write_batch("trading_status", run_id, "fresh", fresh)
+    compact_dataset(
+        tmp_path / "staging",
+        tmp_path / "curated",
+        "trading_status",
+        run_id,
+        partition_col="trade_date",
+    )
+    files = list((tmp_path / "curated" / "trading_status").rglob("*.parquet"))
+    return pl.read_parquet(files[0]).filter(pl.col("symbol") == "600000.SH")
+
+
+@pytest.mark.parametrize("baostock_status", ["st", "normal"])
+def test_compact_baostock_wins_over_stale_current_state_pk(tmp_path, baostock_status):
+    """For this run, the newly fetched baostock row must win the PK on compact."""
+    row = _compact_winner(tmp_path, baostock_status=baostock_status)
+    assert row.height == 1
+    assert row["source"][0] == "baostock"
+    assert row["status"][0] == baostock_status
+    assert row["is_trading"][0] is True
 
 
 def test_reports_failed_symbols_fail_loud():
