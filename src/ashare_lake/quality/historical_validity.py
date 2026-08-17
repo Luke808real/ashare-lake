@@ -115,6 +115,8 @@ def historical_universe_validity(
                     "message": (
                         "delisted coverage is unverified: "
                         f"{counts['pending_probe']} pending probes, "
+                        f"{counts['recent_quarantined']} recent quarantined, "
+                        f"{counts['known_delisted_unreconciled']} known delisted unreconciled, "
                         f"{counts['missing_bars']} missing bars, "
                         f"{counts['unknown_overlap']} unknown overlaps, "
                         f"{counts['terminal_mismatch']} terminal mismatches, "
