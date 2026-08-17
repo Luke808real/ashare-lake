@@ -15,7 +15,10 @@ rebuild can run year-by-year without OOM.
 from __future__ import annotations
 
 import logging
-from datetime import date
+from collections.abc import Mapping
+from datetime import date, datetime
+from typing import Any
+from zoneinfo import ZoneInfo
 
 import polars as pl
 
@@ -29,6 +32,55 @@ logger = logging.getLogger(__name__)
 
 _DERIVED_SOURCE = "derived_bar_gap"
 _STATUS_SPEC = DATASETS["trading_status"]
+_DAILY_STATUS_SOURCES = frozenset({"eastmoney", "tdx_protocol"})
+_SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
+
+
+def _shanghai_date(value: Any) -> date | None:
+    """Wall-clock date in Asia/Shanghai for *value* (UTC-aware or naive)."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        # Naive timestamps are treated as already-UTC (ASL storage norm).
+        value = value.replace(tzinfo=ZoneInfo("UTC"))
+    return value.astimezone(_SHANGHAI_TZ).date()
+
+
+def status_row_precedence_class(row: Mapping[str, Any]) -> str:
+    """Classify one existing ``trading_status`` row for a bar-gap collision.
+
+    Returns one of:
+
+    * ``TRUSTED_SAME_SESSION_DAILY`` — an EastMoney/TDX daily row whose fetch
+      happened on the same Asia/Shanghai session date as its ``trade_date``;
+      it is real same-session evidence and must keep precedence.
+    * ``NON_PIT_DAILY_SNAPSHOT`` — an EastMoney/TDX current-state row fetched
+      on a LATER session than ``trade_date`` (or with unknown fetch time);
+      it is NOT point-in-time evidence for that historical date, so a proven
+      bar-gap suspension wins the PK.
+    * ``BAOSTOCK`` — historical ST rows; preserved, never reclassified.
+    * ``DERIVED_BAR_GAP`` — the generated suspension row itself.
+    * ``OTHER`` — unknown source; preserved, fail closed (no derived override).
+    """
+    source = str(row.get("source") or "")
+    if source == _DERIVED_SOURCE:
+        return "DERIVED_BAR_GAP"
+    if source == "baostock":
+        return "BAOSTOCK"
+    if source in _DAILY_STATUS_SOURCES:
+        trade_date = row.get("trade_date")
+        fetched = _shanghai_date(row.get("fetched_at"))
+        if fetched is not None and isinstance(trade_date, date) and fetched == trade_date:
+            return "TRUSTED_SAME_SESSION_DAILY"
+        return "NON_PIT_DAILY_SNAPSHOT"
+    return "OTHER"
 
 
 def _suspended_pairs(
@@ -157,11 +209,32 @@ def derive_suspension_history(
                 if f.name != "part-merged.parquet":
                     stray_parts.append(f)
         merged = pl.concat(frames, how="diagonal_relaxed")
-        # Real daily rows (non-derived) win on PK overlap: sort them first.
+        if "fetched_at" not in merged.columns:
+            merged = merged.with_columns(pl.lit(None, dtype=pl.Datetime("us")).alias("fetched_at"))
+        # PIT-aware precedence: derived_bar_gap wins ONLY over NON-PIT daily
+        # current-state snapshots. Same-session daily rows, baostock ST rows,
+        # and unknown sources keep precedence (fail closed).
         merged = merged.with_columns(
-            (pl.col("source") == _DERIVED_SOURCE).alias("_is_derived")
-        ).sort("_is_derived")
-        merged = merged.unique(subset=["symbol", "trade_date"], keep="first").drop("_is_derived")
+            pl.struct(["source", "trade_date", "fetched_at"])
+            .map_elements(
+                lambda row: status_row_precedence_class(row),
+                return_dtype=pl.Utf8,
+            )
+            .alias("_prec")
+        )
+        _PRECEDENCE_RANK = {
+            "TRUSTED_SAME_SESSION_DAILY": 0,
+            "BAOSTOCK": 0,
+            "OTHER": 0,
+            "DERIVED_BAR_GAP": 1,
+            "NON_PIT_DAILY_SNAPSHOT": 2,
+        }
+        merged = merged.with_columns(
+            pl.col("_prec").replace_strict(_PRECEDENCE_RANK, default=0).alias("_prec_rank")
+        ).sort("_prec_rank")
+        merged = merged.unique(subset=["symbol", "trade_date"], keep="first").drop(
+            ["_prec", "_prec_rank"]
+        )
         # Reuse compact's filename so we overwrite the single canonical part
         # rather than adding a second file (which would double-count on read).
         writer.write_partition("trading_status", pcol, val, merged, "part-merged.parquet")

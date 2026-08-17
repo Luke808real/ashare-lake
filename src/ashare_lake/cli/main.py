@@ -780,7 +780,12 @@ def backfill(
     _guard_history_horizon(dataset, start_d)
     if symbols_str:
         symbols = [s.strip().upper() for s in symbols_str.split(",") if s.strip()]
-        _override_scope(cfg, dataset, symbols)
+        if dataset == "trading_status":
+            # Historical ST backfill takes a transient symbol scope (the
+            # step's own checkpoint is scope-aware); no config block needed.
+            cfg._backfill_symbols = symbols
+        else:
+            _override_scope(cfg, dataset, symbols)
         click.echo(f"[{dataset}] scope overridden for this run: {len(symbols)} symbol(s)", err=True)
     if start_d:
         cfg._backfill_start = start_d
@@ -2108,7 +2113,31 @@ def delisted_backfill(config_path: str, since: str):
     run_id = engine.manifest.start_run("delisted_backfill", {"since": since})
     result = backfill_delisted_bars(cfg, run_id, date.fromisoformat(since))
     compact_out = engine.run_step("compact", date.today(), run_id)
-    engine.manifest.finish_run(run_id, "success", rows_written=result.get("rows_written", 0))
-    click.echo(
-        json.dumps({"run_id": run_id, **result, "compact": compact_out}, indent=2, default=str)
+
+    failed_n = int(result.get("failed_symbols", 0) or 0)
+    empty_n = int(result.get("empty_symbols", 0) or 0)
+    compact_status = compact_out.get("status")
+    complete = failed_n == 0 and empty_n == 0 and compact_status == "success"
+    run_status = "success" if complete else "failed"
+    error_message = (
+        None
+        if complete
+        else (
+            f"delisted backfill incomplete: failed={failed_n}, empty={empty_n}, compact={compact_status}"
+        )
     )
+    engine.manifest.finish_run(
+        run_id,
+        run_status,
+        rows_written=result.get("rows_written", 0),
+        error_message=error_message,
+    )
+    click.echo(
+        json.dumps(
+            {"run_id": run_id, "status": run_status, **result, "compact": compact_out},
+            indent=2,
+            default=str,
+        )
+    )
+    if not complete:
+        raise click.ClickException(error_message)

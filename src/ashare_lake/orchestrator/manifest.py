@@ -231,6 +231,37 @@ class Manifest:
                 ),
             )
 
+    def supersede_batch(
+        self,
+        run_id: str,
+        batch_id: str,
+        *,
+        superseded_by: str,
+        prior_error: str | None = None,
+    ) -> None:
+        """Mark a failed/stale attempt as resolved by a successful retry.
+
+        The superseded row is retained for audit (identity, symbols, original
+        timestamps); only ``status`` and ``error_message`` change, and the new
+        message names the successful retry batch plus the prior error text.
+        ``superseded`` batches count as resolved everywhere completeness is
+        computed, so a verified successful retry can supersede an old attempt
+        without deleting history.
+        """
+        message = f"superseded by retry batch {superseded_by}"
+        if prior_error:
+            message = f"{message}; prior: {prior_error}"
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE ingestion_batches
+                SET status = 'superseded', error_message = ?
+                WHERE run_id = ? AND batch_id = ?
+                  AND status IN ('failed', 'stale', 'running')
+                """,
+                (message, run_id, batch_id),
+            )
+
     def get_failed_batches(self, run_id: str) -> list[sqlite3.Row]:
         with self._connect() as conn:
             cur = conn.execute(
@@ -246,7 +277,7 @@ class Manifest:
                 """
                 SELECT dataset, COUNT(*) AS cnt
                 FROM ingestion_batches
-                WHERE run_id = ? AND status != 'success'
+                WHERE run_id = ? AND status NOT IN ('success', 'superseded')
                 GROUP BY dataset
                 """,
                 (run_id,),
@@ -259,7 +290,7 @@ class Manifest:
                 """
                 SELECT COUNT(*) AS cnt
                 FROM ingestion_batches
-                WHERE run_id = ? AND status != 'success'
+                WHERE run_id = ? AND status NOT IN ('success', 'superseded')
                 """,
                 (run_id,),
             )
@@ -271,7 +302,7 @@ class Manifest:
                 """
                 SELECT status, COUNT(*) AS cnt
                 FROM ingestion_batches
-                WHERE run_id = ? AND status != 'success'
+                WHERE run_id = ? AND status NOT IN ('success', 'superseded')
                 GROUP BY status
                 """,
                 (run_id,),
