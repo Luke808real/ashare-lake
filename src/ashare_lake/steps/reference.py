@@ -254,10 +254,11 @@ def step_trading_status(config: Config, trade_date: date, run_id: str, context: 
     )
     if df.is_empty():
         return {"rows_read": 0, "rows_written": 0}
-    if "source" not in df.columns:
-        df = normalize_with_source(df)
-    else:
-        df = with_provenance(df, source="eastmoney", data_version="v1")
+    # EastMoney is the only daily status provider; rows fetched here are
+    # current-state snapshots and must not be stamped as TDX (the dataset's
+    # nominal primary source). Correct provenance matters for the
+    # derived-suspension merge precedence later.
+    df = with_provenance(df.drop("source", strict=False), source="eastmoney", data_version="v1")
     return write_simple(config, run_id, "trading_status", df)
 
 

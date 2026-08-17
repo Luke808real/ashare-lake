@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from datetime import date, timedelta
 
 import polars as pl
@@ -212,6 +213,101 @@ def load_symbols(config: Config) -> list[str]:
         config=config,
     )
     return df["symbol"].to_list()
+
+
+def instrument_metadata(config: Config) -> pl.DataFrame:
+    """Narrow instrument metadata (``symbol``, ``list_date``, ``delist_date``).
+
+    Reads only what is already on disk (curated → staging) — never a network
+    fetch, so routing stays offline and cheap. Keeps the listing/delisting
+    dates, which generic daily routing needs to keep already-delisted symbols
+    out of the TDX/EastMoney backfill. Columns absent from a stored frame are
+    filled with nulls rather than failing, so legacy fixtures without dates
+    still classify as active.
+    """
+    curated = config.curated_root / "instruments" / "part-merged.parquet"
+    staging_glob = list(config.staging_root.glob("instruments/run_id=*/part-*.parquet"))
+    if curated.exists():
+        df = pl.read_parquet(curated)
+    elif staging_glob:
+        latest = max(staging_glob, key=lambda p: p.stat().st_mtime)
+        df = pl.read_parquet(latest)
+    else:
+        return pl.DataFrame(
+            schema={"symbol": pl.Utf8, "list_date": pl.Date, "delist_date": pl.Date}
+        )
+    cols = [c for c in ("symbol", "list_date", "delist_date") if c in df.columns]
+    if "symbol" not in cols:
+        return pl.DataFrame(
+            schema={"symbol": pl.Utf8, "list_date": pl.Date, "delist_date": pl.Date}
+        )
+    out = df.select(cols)
+    for col in ("list_date", "delist_date"):
+        if col not in out.columns:
+            out = out.with_columns(pl.lit(None, dtype=pl.Date).alias(col))
+    return out
+
+
+@dataclass
+class DailyRouting:
+    """Delist-aware routing of symbols for one generic daily-bars window.
+
+    ``included`` — symbols still active through the window (``delist_date`` null
+    or after ``end``); the only ones the generic TDX/EastMoney path fetches.
+
+    ``excluded_expected_no_data`` — delisted before ``start`` (no trading overlap
+    with the window, nothing to fetch anywhere) plus symbols listed after
+    ``end`` (no bars can exist inside the window).
+
+    ``excluded_delegated_delisted`` — delisted inside ``[start, end]``; their
+    history belongs to the dedicated delisted recovery path.
+    """
+
+    included: list[str] = field(default_factory=list)
+    excluded_expected_no_data: list[str] = field(default_factory=list)
+    excluded_delegated_delisted: list[str] = field(default_factory=list)
+    excluded_future_listing: list[str] = field(default_factory=list)
+
+    @property
+    def excluded(self) -> list[str]:
+        return self.excluded_expected_no_data + self.excluded_delegated_delisted
+
+    def counts(self) -> dict[str, int]:
+        return {
+            "generic_included": len(self.included),
+            "excluded_expected_no_data": len(self.excluded_expected_no_data),
+            "excluded_delegated_delisted": len(self.excluded_delegated_delisted),
+            "excluded_future_listing": len(self.excluded_future_listing),
+        }
+
+
+def classify_daily_routing(
+    symbols: list[str],
+    spans: dict[str, tuple[date | None, date | None]],
+    start: date,
+    end: date,
+) -> DailyRouting:
+    """Classify *symbols* for generic daily backfill over ``[start, end]``.
+
+    A symbol with ``delist_date <= end`` must not be sent to the generic
+    TDX/EastMoney path: it belongs to the dedicated delisted recovery (or, when
+    it delisted before ``start``, to no fetch at all). Symbols listed after
+    ``end`` have no bars inside the window and are excluded too. Symbols missing
+    from *spans* are treated as active — conservative, never a silent drop.
+    """
+    routing = DailyRouting()
+    for symbol in symbols:
+        list_date, delist_date = spans.get(symbol, (None, None))
+        if delist_date is not None and delist_date < start:
+            routing.excluded_expected_no_data.append(symbol)
+        elif delist_date is not None and delist_date <= end:
+            routing.excluded_delegated_delisted.append(symbol)
+        elif list_date is not None and list_date > end:
+            routing.excluded_future_listing.append(symbol)
+            routing.excluded_expected_no_data.append(symbol)
+        else:
+            routing.included.append(symbol)
+    return routing
 
 
 def load_bar_universe(config: Config) -> set[str]:
